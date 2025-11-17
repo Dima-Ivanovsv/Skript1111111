@@ -1,27 +1,22 @@
-config setup
-    charondebug="ike 2, knl 2, cfg 2"
-    uniqueids=yes
-    strictcrlpolicy=no
-
-conn %default
-    fragmentation=yes
-    rekey=yes
-    reauth=no
-    keyexchange=ikev2
-    mobike=no
-    compress=yes
-
-conn myvpn
-    auto=add
-    left=%defaultroute
-    leftid=your_server_ip  # Замените на публичный IP сервера
-    leftsubnet=0.0.0.0/0
-    leftfirewall=yes
-    right=%any
-    rightsubnet=10.0.0.0/24,192.168.0.0/24  # Подсети клиентов
-    rightid=%any
-    authby=secret
-    ike=aes256-sha2_256-modp2048!
-    esp=aes256-sha2_256!
-    type=tunnel
-    dpdaction=restart
+config setup //Настройки самого демона charon
+    charondebug = "dmn 0, mgr 0, ike 0, chd 0, job 0, cfg 0, knl 0, net 0, asn 0, enc 0, lib 0, esp 0, tls 0, tnc 0, imc 0, imv 0, pts 0" //Отключаем избыточное логирование
+conn %default //Общие настройки для всех соединений
+    reauth = yes
+    rekey = yes
+    keyingtries = %forever
+    keyexchange = ikev2 //Протокол обмена ключами для всех соединений - IKEv2
+    dpdaction = hold
+    dpddelay = 5s //Каждые 5 секунд шлем DPD (Dead Peer Detection) удаленной стороне 
+    mobike = yes //Включаем Mobile IKE - пир может менять свой IP без необходимости переустановки тоннеля
+conn mama //Описываем конкретное соединение
+    left = %defaultroute //Left - наш пир. Директива %defaultroute указывает демону слушать на предмет установки IKE-сессии интрейфейс, котороый смотрит в default route
+    right = %any //Удаленный пир может иметь любой IP-адрес
+    authby = psk //Механизм проверки подлинности - используя секретый ключ
+    leftid = mama@router.home.local //Наш ID, указанный в ipsec.secrets
+    rightid = root@router.mama.local //ID удаленного пира
+    leftsubnet = 10.0.0.0/23,10.1.1.0/24 
+    rightsubnet = 10.0.3.0/24
+    type = tunnel 
+    ike = aes256-aes192-aes128-sha256-sha384-modp2048-modp3072-modp4096-modp8192,aes128gcm16-sha384-x25519!
+    esp = aes256-aes192-aes128-sha256-sha384-modp2048-modp3072-modp4096-modp8192,aes128gcm16-sha256-sha384-x25519! 
+    auto = add //При старте charon просто добавляем соединение и ждем подключения удаленной стороны
