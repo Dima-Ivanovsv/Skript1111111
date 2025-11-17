@@ -1,0 +1,843 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Простейший анализатор безопасности конфигураций VPN (OpenVPN / IPsec)
+с графическим интерфейсом на Tkinter.
+
+Использование:
+    CLI:
+        python vpn_audit.py /путь/к/конфигу.conf
+
+    GUI:
+        python vpn_audit.py
+"""
+
+import sys
+import os
+import re
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext
+
+
+# --------------------- Модель результатов --------------------- #
+
+@dataclass
+class Finding:
+    severity: str  # OK, INFO, WARN, FAIL
+    message: str
+    details: Optional[str] = None
+
+    def format(self) -> str:
+        base = f"[{self.severity}] {self.message}"
+        if self.details:
+            base += f"\n    {self.details}"
+        return base
+
+
+SEVERITY_WEIGHT = {
+    "OK": 0,
+    "INFO": 0,
+    "WARN": 1,
+    "FAIL": 3,
+}
+
+
+def calc_score(findings: List[Finding]) -> int:
+    penalty = 0
+    for f in findings:
+        penalty += SEVERITY_WEIGHT.get(f.severity, 0)
+    score = 100 - penalty * 5
+    if score < 0:
+        score = 0
+    return score
+
+
+def score_to_level(score: int) -> str:
+    if score >= 85:
+        return "высокий"
+    elif score >= 70:
+        return "средний"
+    elif score >= 50:
+        return "низкий"
+    else:
+        return "критический"
+
+
+# --------------------- Детектирование типа конфига --------------------- #
+
+def detect_config_type(lines: List[str]) -> str:
+    """
+    Возвращает 'openvpn', 'ipsec' или 'unknown'.
+    Очень грубая эвристика, но для диплома достаточно.
+    """
+    joined = "\n".join(lines)
+
+    openvpn_markers = [
+        r"\bdev\s+(tun|tap)",
+        r"\bproto\s+(udp|tcp)",
+        r"\bserver\s+\d+\.\d+\.\d+\.\d+",
+        r"\btls-auth\b",
+        r"\btls-crypt\b",
+    ]
+    ipsec_markers = [
+        r"\bconn\s+\S+",
+        r"\bike=",
+        r"\besp=",
+        r"\bauthby=",
+        r"\bkeyexchange=",
+        r"\bpfs=",
+        r"\bleft=",
+        r"\bright=",
+    ]
+
+    score_ovpn = sum(1 for m in openvpn_markers if re.search(m, joined))
+    score_ipsec = sum(1 for m in ipsec_markers if re.search(m, joined))
+
+    if score_ovpn > score_ipsec and score_ovpn > 0:
+        return "openvpn"
+    elif score_ipsec > score_ovpn and score_ipsec > 0:
+        return "ipsec"
+    else:
+        return "unknown"
+
+
+# --------------------- Базовый класс анализатора --------------------- #
+
+class BaseAnalyzer:
+    def __init__(self, lines: List[str]):
+        self.lines = lines
+        # очищенные строки без комментариев
+        self.cleaned_lines = self._cleanup(lines)
+
+    @staticmethod
+    def _cleanup(lines: List[str]) -> List[str]:
+        result = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            # убираем комментарии '#' или ';'
+            if line.startswith("#") or line.startswith(";"):
+                continue
+            # режем по # или ; если встречаются в середине
+            for c in ["#", ";"]:
+                if c in line:
+                    # не очень умно, но часто хватает
+                    line = line.split(c, 1)[0].strip()
+            if line:
+                result.append(line)
+        return result
+
+    def analyze(self) -> List[Finding]:
+        raise NotImplementedError
+
+
+# --------------------- Анализатор OpenVPN --------------------- #
+
+class OpenVPNAnalyzer(BaseAnalyzer):
+    def __init__(self, lines: List[str]):
+        super().__init__(lines)
+        self.options = self._parse_options()
+
+    def _parse_options(self) -> Dict[str, List[str]]:
+        opts: Dict[str, List[str]] = {}
+        for line in self.cleaned_lines:
+            parts = line.split()
+            if not parts:
+                continue
+            key = parts[0]
+            value = " ".join(parts[1:]) if len(parts) > 1 else ""
+            opts.setdefault(key, []).append(value)
+        return opts
+
+    def get(self, key: str) -> Optional[str]:
+        vals = self.options.get(key)
+        if not vals:
+            return None
+        return vals[-1]
+
+    def has(self, key: str) -> bool:
+        return key in self.options
+
+    def analyze(self) -> List[Finding]:
+        findings: List[Finding] = []
+        findings.extend(self._check_dev())
+        findings.extend(self._check_proto())
+        findings.extend(self._check_cipher())
+        findings.extend(self._check_auth())
+        findings.extend(self._check_tls_version())
+        findings.extend(self._check_tls_protection())
+        findings.extend(self._check_compression())
+        findings.extend(self._check_user_group())
+        findings.extend(self._check_reneg())
+        return findings
+
+    # --- Конкретные проверки --- #
+
+    def _check_dev(self) -> List[Finding]:
+        dev = self.get("dev")
+        if not dev:
+            return [Finding("WARN", "Не задан параметр dev (tun/tap).",
+                            "Рекомендуется явно указать dev tun.")]
+        dev = dev.strip()
+        if dev == "tun":
+            return [Finding("OK", "Используется dev tun (маршрутизация IP).")]
+        elif dev == "tap":
+            return [Finding("WARN", "Используется dev tap.",
+                            "TAP даёт L2-сеть и увеличенную поверхность атаки. "
+                            "Используйте tun, если нет жёсткой необходимости в L2.")]
+        else:
+            return [Finding("INFO", f"Неизвестное значение dev: {dev}.")]
+
+    def _check_proto(self) -> List[Finding]:
+        proto = self.get("proto")
+        if not proto:
+            return [Finding("WARN", "Не задан параметр proto.",
+                            "По умолчанию часто используется udp, но лучше указать явно.")]
+        proto = proto.lower()
+        if proto == "udp":
+            return [Finding("OK", "Используется proto udp.")]
+        elif proto == "tcp":
+            return [Finding("INFO", "Используется proto tcp.",
+                            "TCP не является уязвимостью, но может упрощать обнаружение "
+                            "и даёт эффект 'TCP-over-TCP'. UDP обычно предпочтительнее.")]
+        else:
+            return [Finding("INFO", f"Неизвестный протокол: {proto}.")]
+
+    def _check_cipher(self) -> List[Finding]:
+        findings: List[Finding] = []
+        data_ciphers = self.get("data-ciphers")
+        cipher = self.get("cipher")
+
+        ciphers_raw = data_ciphers or cipher or ""
+        ciphers_list: List[str] = []
+
+        # data-ciphers: aes-256-gcm:aes-128-gcm:chacha20-poly1305
+        if ":" in ciphers_raw:
+            ciphers_list = [c.strip() for c in ciphers_raw.split(":") if c.strip()]
+        elif ciphers_raw:
+            ciphers_list = [ciphers_raw.strip()]
+
+        if not ciphers_list:
+            findings.append(Finding(
+                "WARN",
+                "Не указаны data-ciphers/cipher.",
+                "OpenVPN по умолчанию может использовать устаревшие алгоритмы. "
+                "Рекомендуется явно указать например: data-ciphers AES-256-GCM:CHACHA20-POLY1305."
+            ))
+            return findings
+
+        weak = []
+        legacy = []
+        strong = []
+
+        for c in ciphers_list:
+            cu = c.upper()
+            if "AES-256-GCM" in cu or "AES-128-GCM" in cu or "CHACHA20-POLY1305" in cu:
+                strong.append(c)
+            elif "AES-256-CBC" in cu or "AES-128-CBC" in cu:
+                legacy.append(c)
+            elif any(x in cu for x in ["BF-CBC", "DES", "RC2", "RC4", "IDEA", "NULL", "NONE"]):
+                weak.append(c)
+            else:
+                legacy.append(c)  # неизвестное считаем сомнительным
+
+        if weak:
+            findings.append(Finding(
+                "FAIL",
+                f"Используются заведомо слабые шифры: {', '.join(weak)}.",
+                "Необходимо отключить их и оставить только современные шифры (AES-GCM, CHACHA20-POLY1305)."
+            ))
+        if legacy and not weak:
+            findings.append(Finding(
+                "WARN",
+                f"Используются шифры среднего уровня/устаревающие: {', '.join(legacy)}.",
+                "Рекомендуется перейти на AEAD-шифры: AES-256-GCM, AES-128-GCM, CHACHA20-POLY1305."
+            ))
+        if strong and not weak:
+            findings.append(Finding(
+                "OK",
+                f"Заданы современные шифры: {', '.join(strong)}."
+            ))
+
+        return findings
+
+    def _check_auth(self) -> List[Finding]:
+        auth = self.get("auth")
+        if not auth:
+            return [Finding(
+                "WARN",
+                "Не указан параметр auth (хеш-функция для HMAC).",
+                "Рекомендуется auth SHA256 или выше."
+            )]
+        au = auth.upper()
+        if "MD5" in au or "SHA1" == au or "SHA-1" in au:
+            return [Finding(
+                "WARN",
+                f"Используется слабый или устаревший auth: {auth}.",
+                "Рекомендуется SHA256/384/512."
+            )]
+        elif "SHA256" in au or "SHA-256" in au or "SHA384" in au or "SHA512" in au:
+            return [Finding("OK", f"Хеш-функция для HMAC: {auth} (современная).")]
+        else:
+            return [Finding("INFO", f"Неизвестное значение auth: {auth}.")]
+
+    def _check_tls_version(self) -> List[Finding]:
+        tls_min = self.get("tls-version-min")
+        if not tls_min:
+            return [Finding(
+                "WARN",
+                "Не задан tls-version-min.",
+                "Рекомендуется минимум TLS 1.2: tls-version-min 1.2."
+            )]
+        ver = tls_min.strip()
+        try:
+            v = float(ver)
+        except ValueError:
+            return [Finding("INFO", f"Непонятное значение tls-version-min: {ver}.")]
+        if v < 1.2:
+            return [Finding(
+                "FAIL",
+                f"tls-version-min {ver} (меньше 1.2).",
+                "Версии TLS ниже 1.2 не рекомендуются к использованию."
+            )]
+        elif v == 1.2:
+            return [Finding("OK", "Минимальная версия TLS: 1.2.")]
+        else:
+            return [Finding("OK", f"Минимальная версия TLS: {ver} (это хорошо).")]
+
+    def _check_tls_protection(self) -> List[Finding]:
+        has_ta = self.has("tls-auth")
+        has_tc = self.has("tls-crypt")
+        if has_tc:
+            return [Finding(
+                "OK",
+                "Используется tls-crypt.",
+                "Это защищает от некоторых DoS и сканирования порта."
+            )]
+        if has_ta:
+            return [Finding(
+                "OK",
+                "Используется tls-auth.",
+                "Рекомендуется рассмотреть переход на tls-crypt, если возможно."
+            )]
+        return [Finding(
+            "INFO",
+            "Не используется tls-auth/tls-crypt.",
+            "Рекомендуется добавить tls-crypt (или хотя бы tls-auth) для защиты канала управления."
+        )]
+
+    def _check_compression(self) -> List[Finding]:
+        findings = []
+        if self.has("comp-lzo") or self.has("compress"):
+            findings.append(Finding(
+                "WARN",
+                "Включена компрессия (comp-lzo/compress).",
+                "Компрессия в VPN может приводить к атакам типа VORACLE. "
+                "Рекомендуется отключать её для трафика с чувствительными данными."
+            ))
+        else:
+            findings.append(Finding(
+                "OK",
+                "Компрессия в конфиге не обнаружена."
+            ))
+        return findings
+
+    def _check_user_group(self) -> List[Finding]:
+        user = self.get("user")
+        group = self.get("group")
+        if user or group:
+            return [Finding(
+                "OK",
+                f"Демон OpenVPN настроен на понижение привилегий (user={user}, group={group})."
+            )]
+        else:
+            return [Finding(
+                "WARN",
+                "Не указаны user/group.",
+                "Сервер, вероятно, работает с root-привилегиями. "
+                "Рекомендуется указать user nobody / group nogroup (или аналогичные)."
+            )]
+
+    def _check_reneg(self) -> List[Finding]:
+        reneg = self.get("reneg-sec")
+        if not reneg:
+            return [Finding(
+                "INFO",
+                "Не задан reneg-sec.",
+                "По умолчанию OpenVPN периодически перевыдаёт ключи, это хорошо. "
+                "Можно явно контролировать интервал."
+            )]
+        try:
+            v = int(reneg.strip())
+        except ValueError:
+            return [Finding("INFO", f"Непонятное значение reneg-sec: {reneg}.")]
+        if v <= 0:
+            return [Finding(
+                "FAIL",
+                f"reneg-sec = {v} (отключён или некорректен).",
+                "Отключение переустановки ключей снижает безопасность."
+            )]
+        elif v > 86400:  # 24 часа
+            return [Finding(
+                "WARN",
+                f"reneg-sec = {v} секунд (> 24 часов).",
+                "Рекомендуется делать переустановку ключей чаще (например, каждые 1–4 часа)."
+            )]
+        else:
+            return [Finding("OK", f"Интервал reneg-sec = {v} сек (разумное значение).")]
+
+
+# --------------------- Анализатор IPsec (strongSwan/Libreswan) --------------------- #
+
+class IPsecAnalyzer(BaseAnalyzer):
+    def __init__(self, lines: List[str]):
+        super().__init__(lines)
+        self.conns = self._parse_conns()
+
+    def _parse_conns(self) -> Dict[str, Dict[str, str]]:
+        """
+        Очень упрощённый парсер блоков conn NAME.
+        Возвращает словарь: {conn_name: {opt: value, ...}}
+        """
+        conns: Dict[str, Dict[str, str]] = {}
+        current_name = None
+
+        for line in self.cleaned_lines:
+            if line.lower().startswith("conn "):
+                current_name = line.split(None, 1)[1].strip()
+                conns[current_name] = {}
+                continue
+            if current_name is None:
+                continue
+            # Форматы: key=value  или  key value
+            if "=" in line:
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                conns[current_name][k] = v
+            else:
+                parts = line.split(None, 1)
+                if len(parts) == 2:
+                    k, v = parts[0].strip(), parts[1].strip()
+                    conns[current_name][k] = v
+
+        return conns
+
+    def analyze(self) -> List[Finding]:
+        findings: List[Finding] = []
+
+        if not self.conns:
+            findings.append(Finding(
+                "WARN",
+                "Не найдено ни одного блока conn в конфигурации IPsec.",
+                "Возможно, это не ipsec.conf или в нём нет определённых соединений."
+            ))
+            return findings
+
+        for name, opts in self.conns.items():
+            findings.append(Finding("INFO", f"Проверка соединения conn {name}:"))
+
+            findings.extend(self._check_keyexchange(name, opts))
+            findings.extend(self._check_ike(name, opts))
+            findings.extend(self._check_esp(name, opts))
+            findings.extend(self._check_pfs(name, opts))
+            findings.extend(self._check_lifetimes(name, opts))
+            findings.extend(self._check_authby(name, opts))
+
+        return findings
+
+    # --- Вспомогательные функции --- #
+
+    @staticmethod
+    def _split_proposals(prop: str) -> List[str]:
+        # ike=aes256-sha256-modp2048,aes256-sha1-modp1024
+        prop = prop.strip().lower()
+        if not prop:
+            return []
+        # убираем "!" и подобное
+        prop = prop.replace("!", "")
+        parts = [p.strip() for p in prop.split(",") if p.strip()]
+        return parts
+
+    @staticmethod
+    def _classify_proposal(p: str) -> Dict[str, bool]:
+        """
+        Очень грубая классификация IKE/ESP-предложения.
+        Возвращает словарь: {weak: bool, legacy: bool, strong: bool}
+        """
+        enc_strong = any(x in p for x in ["aes256", "aes-256", "aes_gcm", "aes256gcm", "chacha20"])
+        enc_legacy = any(x in p for x in ["aes128", "aes-128", "3des"])
+        enc_weak = any(x in p for x in ["des", "null", "rc4", "bf", "blowfish"])
+
+        auth_weak = any(x in p for x in ["md5"])
+        auth_legacy = any(x in p for x in ["sha1", "sha-1"])
+        auth_strong = any(x in p for x in ["sha2", "sha-256", "sha256", "sha384", "sha512"])
+
+        dh_weak = any(x in p for x in ["modp768", "modp1024"])
+        dh_ok = any(x in p for x in [
+            "modp1536", "modp2048", "modp3072", "modp4096", "ecp256", "ecp384", "ecp521"
+        ])
+
+        weak = enc_weak or auth_weak or dh_weak
+        strong = enc_strong and auth_strong and dh_ok and not weak
+        legacy = (enc_legacy or auth_legacy) and not weak and not strong
+
+        return {"weak": weak, "legacy": legacy, "strong": strong}
+
+    # --- Конкретные проверки --- #
+
+    def _check_keyexchange(self, name: str, opts: Dict[str, str]) -> List[Finding]:
+        keyex = opts.get("keyexchange") or opts.get("ikev2")
+        if not keyex:
+            return [Finding(
+                "WARN",
+                f"[{name}] Не задан параметр keyexchange/ikev2.",
+                "Рекомендуется использовать IKEv2 (keyexchange=ikev2 или ikev2=insist)."
+            )]
+        k = keyex.lower()
+        if "ikev2" in k:
+            return [Finding("OK", f"[{name}] Используется IKEv2 ({keyex}).")]
+        elif "ikev1" in k:
+            return [Finding(
+                "WARN",
+                f"[{name}] Используется IKEv1 ({keyex}).",
+                "Рекомендуется переход на IKEv2."
+            )]
+        else:
+            return [Finding("INFO", f"[{name}] Непонятное значение keyexchange/ikev2: {keyex}.")]
+
+    def _check_ike(self, name: str, opts: Dict[str, str]) -> List[Finding]:
+        ike = opts.get("ike")
+        if not ike:
+            return [Finding(
+                "WARN",
+                f"[{name}] Не задан параметр ike.",
+                "Обязательно задайте ike с современными алгоритмами, например: "
+                "ike=aes256-sha2_256-modp2048!"
+            )]
+        proposals = self._split_proposals(ike)
+        weak = legacy = strong = 0
+        for p in proposals:
+            c = self._classify_proposal(p)
+            weak += c["weak"]
+            legacy += c["legacy"]
+            strong += c["strong"]
+
+        findings: List[Finding] = []
+        if weak:
+            findings.append(Finding(
+                "FAIL",
+                f"[{name}] В ike присутствуют слабые предложения: {ike}.",
+                "Уберите DES/MD5/modp1024 и подобные алгоритмы."
+            ))
+        if legacy and not weak:
+            findings.append(Finding(
+                "WARN",
+                f"[{name}] В ike используются устаревающие алгоритмы: {ike}.",
+                "Рекомендуется оставить только варианты с AES-256 и SHA2, группы MODP>=2048 или ECP."
+            ))
+        if strong and not weak:
+            findings.append(Finding(
+                "OK",
+                f"[{name}] В ike есть современные предложения (AES-256 + SHA2 + MODP>=2048/ECP)."
+            ))
+        if not (weak or legacy or strong):
+            findings.append(Finding(
+                "INFO",
+                f"[{name}] Не удалось классифицировать ike={ike}. Проверьте вручную."
+            ))
+        return findings
+
+    def _check_esp(self, name: str, opts: Dict[str, str]) -> List[Finding]:
+        esp = opts.get("esp") or opts.get("phase2alg")
+        if not esp:
+            return [Finding(
+                "WARN",
+                f"[{name}] Не задан параметр esp/phase2alg.",
+                "Обязательно задайте ESP-алгоритмы, например: "
+                "esp=aes256-sha2_256-modp2048!"
+            )]
+        proposals = self._split_proposals(esp)
+        weak = legacy = strong = 0
+        for p in proposals:
+            c = self._classify_proposal(p)
+            weak += c["weak"]
+            legacy += c["legacy"]
+            strong += c["strong"]
+
+        findings: List[Finding] = []
+        if weak:
+            findings.append(Finding(
+                "FAIL",
+                f"[{name}] В esp присутствуют слабые предложения: {esp}.",
+                "Уберите DES/MD5/modp1024 и подобные алгоритмы."
+            ))
+        if legacy and not weak:
+            findings.append(Finding(
+                "WARN",
+                f"[{name}] В esp используются устаревающие алгоритмы: {esp}.",
+                "Рекомендуется оставить только варианты с AES-256/AES-GCM + SHA2 + MODP>=2048/ECP."
+            ))
+        if strong and not weak:
+            findings.append(Finding(
+                "OK",
+                f"[{name}] В esp есть современные предложения (AES-256/AES-GCM + SHA2 + MODP>=2048/ECP)."
+            ))
+        if not (weak or legacy or strong):
+            findings.append(Finding(
+                "INFO",
+                f"[{name}] Не удалось классифицировать esp/phase2alg={esp}. Проверьте вручную."
+            ))
+        return findings
+
+    def _check_pfs(self, name: str, opts: Dict[str, str]) -> List[Finding]:
+        pfs = opts.get("pfs")
+        if not pfs:
+            return [Finding(
+                "WARN",
+                f"[{name}] Не задан параметр pfs.",
+                "Рекомендуется pfs=yes для использования perfect forward secrecy."
+            )]
+        p = pfs.lower()
+        if p in ["yes", "on", "force"]:
+            return [Finding("OK", f"[{name}] Включён PFS (pfs={pfs}).")]
+        elif p in ["no", "off"]:
+            return [Finding(
+                "FAIL",
+                f"[{name}] PFS отключён (pfs={pfs}).",
+                "Рекомендуется включить PFS для всех туннелей."
+            )]
+        else:
+            return [Finding("INFO", f"[{name}] Непонятное значение pfs={pfs}.")]
+
+    def _check_lifetimes(self, name: str, opts: Dict[str, str]) -> List[Finding]:
+        findings: List[Finding] = []
+        for key in ["ikelifetime", "keylife", "salifetime"]:
+            val = opts.get(key)
+            if not val:
+                continue
+            v = val.lower()
+            # очень грубо: если явно есть "h" – считаем часы
+            # пример: 1h, 8h, 24h
+            if v.endswith("h"):
+                try:
+                    hours = int(v[:-1])
+                except ValueError:
+                    continue
+                if hours > 24:
+                    findings.append(Finding(
+                        "WARN",
+                        f"[{name}] {key}={val} (>24 часов).",
+                        "Рекомендуется делать переустановку ключей чаще (1–8 часов)."
+                    ))
+                elif hours >= 1:
+                    findings.append(Finding(
+                        "OK",
+                        f"[{name}] {key}={val} (разумный интервал)."
+                    ))
+            # можно расширить разбор s/m, но для примера достаточно
+        return findings
+
+    def _check_authby(self, name: str, opts: Dict[str, str]) -> List[Finding]:
+        authby = opts.get("authby")
+        if not authby:
+            return [Finding(
+                "INFO",
+                f"[{name}] Не указан authby.",
+                "По умолчанию могут использоваться сертификаты. Проверьте, если требуется PSK или EAP."
+            )]
+        a = authby.lower()
+        if "rsasig" in a or "ecdsa" in a:
+            return [Finding("OK", f"[{name}] Используется аутентификация по сертификатам (authby={authby}).")]
+        elif "secret" in a:
+            return [Finding(
+                "INFO",
+                f"[{name}] Используется PSK (authby={authby}).",
+                "PSK допустимы, но важно обеспечить достаточную длину и случайность ключей."
+            )]
+        else:
+            return [Finding("INFO", f"[{name}] Непонятное значение authby={authby}.")]
+
+
+# --------------------- CLI-режим --------------------- #
+
+def cli_main():
+    if len(sys.argv) != 2:
+        print("Использование: python vpn_audit.py /путь/к/конфигу.conf")
+        sys.exit(1)
+
+    path = sys.argv[1]
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except UnicodeDecodeError:
+        # на случай ANSI/Windows-1251
+        with open(path, "r", encoding="cp1251", errors="ignore") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        print(f"Файл не найден: {path}")
+        sys.exit(1)
+
+    cfg_type = detect_config_type(lines)
+
+    if cfg_type == "openvpn":
+        analyzer = OpenVPNAnalyzer(lines)
+        title = "Отчёт по безопасности конфигурации OpenVPN"
+    elif cfg_type == "ipsec":
+        analyzer = IPsecAnalyzer(lines)
+        title = "Отчёт по безопасности конфигурации IPsec"
+    else:
+        print("Не удалось определить тип конфигурации (OpenVPN/IPsec).")
+        print("Можно принудительно дописать поддержку конкретного формата в коде.")
+        sys.exit(1)
+
+    findings = analyzer.analyze()
+    score = calc_score(findings)
+    level = score_to_level(score)
+
+    print("=" * 70)
+    print(title)
+    print("=" * 70)
+    print(f"Итоговый балл: {score}/100 (уровень: {level})")
+    print("-" * 70)
+    print("Детализированный отчёт:")
+    print()
+
+    for f in findings:
+        print(f.format())
+        print()
+
+
+# --------------------- GUI-логика --------------------- #
+
+def analyze_file(path: str) -> str:
+    """
+    Читает файл конфига, определяет тип (OpenVPN/IPsec),
+    запускает анализ и возвращает готовый текстовый отчёт.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except UnicodeDecodeError:
+        with open(path, "r", encoding="cp1251", errors="ignore") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Файл не найден: {path}")
+
+    cfg_type = detect_config_type(lines)
+
+    if cfg_type == "openvpn":
+        analyzer = OpenVPNAnalyzer(lines)
+        title = "Отчёт по безопасности конфигурации OpenVPN"
+    elif cfg_type == "ipsec":
+        analyzer = IPsecAnalyzer(lines)
+        title = "Отчёт по безопасности конфигурации IPsec"
+    else:
+        raise ValueError(
+            "Не удалось определить тип конфигурации (OpenVPN/IPsec).\n"
+            "Проверьте, тот ли файл вы выбрали."
+        )
+
+    findings = analyzer.analyze()
+    score = calc_score(findings)
+    level = score_to_level(score)
+
+    out_lines = []
+    out_lines.append("=" * 70)
+    out_lines.append(title)
+    out_lines.append("=" * 70)
+    out_lines.append(f"Файл: {path}")
+    out_lines.append(f"Итоговый балл: {score}/100 (уровень: {level})")
+    out_lines.append("-" * 70)
+    out_lines.append("Детализированный отчёт:")
+    out_lines.append("")
+
+    for f in findings:
+        line = f"[{f.severity}] {f.message}"
+        out_lines.append(line)
+        if f.details:
+            out_lines.append(f"    {f.details}")
+        out_lines.append("")
+
+    return "\n".join(out_lines)
+
+
+class VPNAuditApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("VPN Config Security Audit")
+        self.geometry("900x600")
+
+        self.path_var = tk.StringVar()
+        self._build_ui()
+
+    def _build_ui(self):
+        # Верхняя панель с выбором файла и кнопкой "Анализировать"
+        top_frame = tk.Frame(self)
+        top_frame.pack(fill=tk.X, padx=10, pady=10)
+
+        lbl = tk.Label(top_frame, text="Конфиг VPN:")
+        lbl.pack(side=tk.LEFT)
+
+        entry = tk.Entry(top_frame, textvariable=self.path_var)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        btn_browse = tk.Button(top_frame, text="Обзор...", command=self.browse_file)
+        btn_browse.pack(side=tk.LEFT, padx=5)
+
+        btn_analyze = tk.Button(top_frame, text="Анализировать", command=self.run_analysis)
+        btn_analyze.pack(side=tk.LEFT, padx=5)
+
+        # Большое текстовое поле с прокруткой для отчёта
+        self.text_report = scrolledtext.ScrolledText(self, wrap=tk.WORD)
+        self.text_report.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        # Немного оформления
+        self.text_report.insert(tk.END, "Выберите файл конфигурации и нажмите «Анализировать».\n")
+
+    def browse_file(self):
+        path = filedialog.askopenfilename(
+            title="Выберите конфигурационный файл VPN",
+            filetypes=(
+                ("Конфиги VPN", "*.conf *.ovpn *.cfg *.cnf"),
+                ("Все файлы", "*.*"),
+            )
+        )
+        if path:
+            self.path_var.set(path)
+
+    def run_analysis(self):
+        path = self.path_var.get().strip()
+        if not path:
+            messagebox.showwarning("Нет файла", "Сначала укажите файл конфигурации.")
+            return
+
+        if not os.path.exists(path):
+            messagebox.showerror("Ошибка", f"Файл не найден:\n{path}")
+            return
+
+        try:
+            report = analyze_file(path)
+        except Exception as e:
+            messagebox.showerror("Ошибка анализа", str(e))
+            return
+
+        self.text_report.delete("1.0", tk.END)
+        self.text_report.insert(tk.END, report)
+
+
+# --------------------- Точка входа --------------------- #
+
+if __name__ == "__main__":
+    # Если передан аргумент — работаем как CLI
+    if len(sys.argv) > 1:
+        cli_main()
+    else:
+        # Иначе запускаем GUI
+        app = VPNAuditApp()
+        app.mainloop()
