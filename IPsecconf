@@ -1,0 +1,27 @@
+config setup
+    charondebug="ike 2, knl 2, cfg 2"
+    uniqueids=yes
+    strictcrlpolicy=no
+
+conn %default
+    fragmentation=yes
+    rekey=yes
+    reauth=no
+    keyexchange=ikev2
+    mobike=no
+    compress=yes
+
+conn myvpn
+    auto=add
+    left=%defaultroute
+    leftid=your_server_ip  # Замените на публичный IP сервера
+    leftsubnet=0.0.0.0/0
+    leftfirewall=yes
+    right=%any
+    rightsubnet=10.0.0.0/24,192.168.0.0/24  # Подсети клиентов
+    rightid=%any
+    authby=secret
+    ike=aes256-sha2_256-modp2048!
+    esp=aes256-sha2_256!
+    type=tunnel
+    dpdaction=restart
