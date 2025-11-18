@@ -665,27 +665,40 @@ def analyze_openvpn_config_text(text: str) -> str:
 
 # ---------------- GUI ----------------
 
+# ---------------- GUI ----------------
+
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
+
 
 def run_gui():
     root = tk.Tk()
     root.title("OpenVPN Security Analyzer")
     root.geometry("900x700")
 
-    lbl = tk.Label(root, text="Выберите файл конфигурации OpenVPN (.conf / .ovpn)", anchor="w")
+    # Верхняя надпись
+    lbl = tk.Label(
+        root,
+        text="Выберите файл конфигурации OpenVPN (.conf / .ovpn)",
+        anchor="w"
+    )
     lbl.pack(fill="x", padx=10, pady=5)
 
+    # Кнопки
     frame_btn = tk.Frame(root)
     frame_btn.pack(fill="x", padx=10, pady=5)
 
     path_var = tk.StringVar()
     type_var = tk.StringVar()
 
-    txt = ScrolledText(root, wrap="word")
+    # Текстовое поле с отчётом
+    txt = ScrolledText(root, wrap="word", font=("Consolas", 10))
     txt.pack(fill="both", expand=True, padx=10, pady=5)
-    txt.insert(tk.END, "Загрузите файл конфигурации OpenVPN, чтобы получить отчёт по безопасности...\n")
+    txt.insert(
+        tk.END,
+        "Загрузите файл конфигурации OpenVPN, чтобы получить отчёт по безопасности...\n"
+    )
 
     def choose_file():
         filename = filedialog.askopenfilename(
@@ -697,7 +710,10 @@ def run_gui():
         )
         if not filename:
             return
+
         path_var.set(filename)
+
+        # читаем файл с нормальной обработкой кодировки
         try:
             with open(filename, "r", encoding="utf-8") as f:
                 text = f.read()
@@ -707,9 +723,17 @@ def run_gui():
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось прочитать файл:\n{e}")
             return
-        report = analyze_openvpn_config_text(text)
+
+        try:
+            report = analyze_openvpn_config_text(text)
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Ошибка при анализе конфигурации:\n{e}")
+            return
+
         txt.delete("1.0", tk.END)
         txt.insert(tk.END, report)
+
+        # первая строка отчёта = тип конфига
         first_line = report.splitlines()[0] if report else ""
         type_var.set(first_line)
 
@@ -732,6 +756,7 @@ def run_gui():
     type_lbl.pack(fill="x", padx=10, pady=2)
 
     root.mainloop()
+
 
 if __name__ == "__main__":
     run_gui()
