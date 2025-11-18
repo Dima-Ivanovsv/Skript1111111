@@ -1,0 +1,737 @@
+import re
+from typing import List, Dict, Tuple
+
+STATUS_ORDER = ["good", "ok", "bad", "critical"]
+
+def normalize_status(s: str) -> str:
+    if not s:
+        return "ok"
+    s = s.strip().lower()
+    if s not in STATUS_ORDER:
+        return "ok"
+    return s
+
+def parse_openvpn_config(text: str) -> Tuple[List[Tuple[str, List[str]]], Dict[str, List[List[str]]]]:
+    entries: List[Tuple[str, List[str]]] = []
+    directives: Dict[str, List[List[str]]] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+        # отрезаем инлайновые комментарии, если они не в кавычках
+        for sep in ("#", ";"):
+            if sep in line:
+                parts = line.split(sep, 1)
+                if parts[0].count('"') % 2 == 0 and parts[0].count("'") % 2 == 0:
+                    line = parts[0].strip()
+        if not line:
+            continue
+        tokens = line.split()
+        key = tokens[0].lower()
+        args = tokens[1:]
+        entries.append((key, args))
+        directives.setdefault(key, []).append(args)
+    return entries, directives
+
+def has_directive(directives: Dict[str, List[List[str]]], name: str) -> bool:
+    return name.lower() in directives
+
+def get_first_arg(directives: Dict[str, List[List[str]]], name: str):
+    name = name.lower()
+    if name in directives and directives[name]:
+        if directives[name][0]:
+            return directives[name][0][0]
+    return None
+
+def list_pushes(directives: Dict[str, List[List[str]]]) -> List[str]:
+    return [" ".join(args) for args in directives.get("push", [])]
+
+def detect_config_type(directives: Dict[str, List[List[str]]]) -> str:
+    # явные признаки
+    if has_directive(directives, "server") or has_directive(directives, "server-bridge"):
+        return "server"
+    if has_directive(directives, "client"):
+        return "client"
+    # эвристика
+    server_ind = {"server", "server-bridge", "ifconfig-pool-persist", "push",
+                  "duplicate-cn", "verify-client-cert", "crl-verify", "client-to-client"}
+    client_ind = {"remote", "auth-user-pass", "nobind", "remote-cert-tls"}
+    s_score = sum(1 for k in server_ind if has_directive(directives, k))
+    c_score = sum(1 for k in client_ind if has_directive(directives, k))
+    if s_score > c_score:
+        return "server"
+    if c_score > s_score:
+        return "client"
+    return "unknown"
+
+def status_worse(a: str, b: str) -> str:
+    a = normalize_status(a)
+    b = normalize_status(b)
+    return a if STATUS_ORDER.index(a) > STATUS_ORDER.index(b) else b
+
+def analyze_common_crypto(directives: Dict[str, List[List[str]]]) -> List[Dict]:
+    results = []
+    modern_good = {"aes-256-gcm", "aes-128-gcm", "chacha20-poly1305"}
+    old_ok = {"aes-256-cbc", "aes-192-gcm", "aes-128-cbc"}
+    very_bad = {"bf-cbc", "des-cbc", "des-ede3-cbc", "none"}
+
+    # data-ciphers
+    if has_directive(directives, "data-ciphers"):
+        arg_line = " ".join(directives["data-ciphers"][0])
+        ciphers = {c.strip().lower() for c in re.split(r"[,\s]+", arg_line) if c.strip()}
+        if ciphers & very_bad:
+            status = "critical"
+            detail = ("Обнаружены устаревшие и небезопасные шифры: "
+                      f"{', '.join(sorted(ciphers & very_bad)).upper()}. "
+                      "Рекомендуется немедленно убрать их.")
+        elif (ciphers & old_ok) and not (ciphers & modern_good):
+            status = "bad"
+            detail = ("Используются устаревшие шифры "
+                      f"({', '.join(sorted(ciphers & old_ok)).upper()}) без современных GCM/CHACHA20. "
+                      "Рекомендуется перейти на AES-256-GCM/AES-128-GCM/CHACHA20-POLY1305.")
+        elif ciphers & modern_good:
+            status = "good"
+            detail = ("Параметр data-ciphers задан и использует современные шифры: "
+                      f"{', '.join(sorted(ciphers & modern_good)).upper()}.")
+        else:
+            status = "ok"
+            detail = ("Параметр data-ciphers задан, но используется нестандартный набор шифров. "
+                      "Проверьте их стойкость.")
+    else:
+        status = "bad"
+        detail = ("Параметр data-ciphers не задан. "
+                  "OpenVPN использует значения по умолчанию, но лучше явно задать современные шифры "
+                  "(AES-256-GCM/AES-128-GCM/CHACHA20-POLY1305).")
+    results.append({"param": "data-ciphers", "status": status, "detail": detail})
+
+    # data-ciphers-fallback
+    if has_directive(directives, "data-ciphers-fallback"):
+        status = "good"
+        detail = ("Параметр data-ciphers-fallback задан. "
+                  "Это обеспечивает совместимость со старыми клиентами.")
+    else:
+        status = "bad"
+        detail = ("Параметр data-ciphers-fallback не задан. "
+                  "При наличии старых клиентов возможны проблемы совместимости, "
+                  "рекомендуется указать безопасный резервный шифр (например AES-256-CBC).")
+    results.append({"param": "data-ciphers-fallback", "status": status, "detail": detail})
+
+    # cipher (legacy)
+    if has_directive(directives, "cipher"):
+        status = "critical"
+        detail = ("Обнаружен устаревший параметр cipher. "
+                  "Современные конфигурации должны использовать data-ciphers/data-ciphers-fallback. "
+                  "Рекомендуется удалить cipher.")
+        results.append({"param": "cipher", "status": status, "detail": detail})
+
+    # auth
+    if has_directive(directives, "auth"):
+        alg = get_first_arg(directives, "auth")
+        alg_low = (alg or "").lower()
+        if alg_low in {"sha256", "sha384", "sha512"}:
+            status = "good"
+            detail = f"Используется современный HMAC-алгоритм {alg.upper()} для аутентификации пакетов."
+        elif alg_low in {"md5", "sha1"}:
+            status = "bad"
+            detail = (f"Используется устаревший HMAC-алгоритм {alg.upper()} (считается слабым). "
+                      "Рекомендуется перейти на SHA256/SHA384/SHA512.")
+        else:
+            status = "ok"
+            detail = (f"Параметр auth задан ({alg.upper()}), "
+                      "проверьте его стойкость в актуальных рекомендациях.")
+    else:
+        status = "bad"
+        detail = ("Параметр auth не задан. "
+                  "OpenVPN использует значение по умолчанию (обычно SHA256), "
+                  "но рекомендуется задать его явно.")
+    results.append({"param": "auth", "status": status, "detail": detail})
+
+    # replay-window
+    if has_directive(directives, "replay-window"):
+        status = "good"
+        detail = "Параметр replay-window задан, защита от replay-атак включена."
+    else:
+        status = "bad"
+        detail = ("Параметр replay-window не задан. "
+                  "OpenVPN использует настройки по умолчанию, "
+                  "но лучше явно настроить окно защиты от replay-атак.")
+    results.append({"param": "replay-window", "status": status, "detail": detail})
+
+    # mute-replay-warnings
+    if has_directive(directives, "mute-replay-warnings"):
+        status = "bad"
+        detail = ("Параметр mute-replay-warnings отключает предупреждения о повторных пакетах в логах. "
+                  "Это затрудняет диагностику атак и, как правило, не рекомендуется.")
+        results.append({"param": "mute-replay-warnings", "status": status, "detail": detail})
+
+    return results
+
+def analyze_common_network(directives: Dict[str, List[List[str]]], config_type: str) -> List[Dict]:
+    results = []
+    # proto
+    if has_directive(directives, "proto"):
+        proto = get_first_arg(directives, "proto")
+        pl = (proto or "").lower()
+        if pl.startswith("udp"):
+            status = "good"
+            detail = ("Используется proto UDP — быстрее, меньше заметен и менее чувствителен "
+                      "к DoS, чем TCP.")
+        elif pl.startswith("tcp"):
+            status = "bad"
+            detail = ("Используется proto TCP. Это работает, но менее эффективно и повышает "
+                      "риски DoS/фингерпринтинга. Рекомендуется UDP, если нет строгих ограничений.")
+        else:
+            status = "ok"
+            detail = f"Используется нетипичный протокол '{proto}'. Проверьте необходимость."
+    else:
+        status = "bad"
+        detail = ("Параметр proto не задан, используются значения по умолчанию. "
+                  "Рекомендуется явно указать proto udp.")
+    results.append({"param": "proto", "status": status, "detail": detail})
+
+    # dev
+    if has_directive(directives, "dev"):
+        dev = get_first_arg(directives, "dev")
+        dl = (dev or "").lower()
+        if dl == "tun":
+            status = "good"
+            detail = ("Используется dev tun — передаются только IP-пакеты, "
+                      "клиент не видит всю L2-сеть, проще фильтровать трафик.")
+        elif dl == "tap":
+            status = "bad"
+            detail = ("Используется dev tap — пробрасывается L2, клиент видит всю локальную сеть. "
+                      "Это чаще всего избыточно и менее безопасно.")
+        else:
+            status = "ok"
+            detail = f"Используется нетипичный тип интерфейса dev {dev}. Проверьте необходимость."
+    else:
+        status = "critical"
+        detail = ("Параметр dev не задан. Это может привести к неочевидному режиму работы. "
+                  "Рекомендуется явно указать dev tun.")
+    results.append({"param": "dev", "status": status, "detail": detail})
+
+    # port / remote port
+    if config_type == "server":
+        if has_directive(directives, "port"):
+            port = get_first_arg(directives, "port")
+            try:
+                p = int(port)
+            except (TypeError, ValueError):
+                p = None
+            if p == 1194:
+                status = "good"
+                detail = "Используется стандартный порт OpenVPN 1194/UDP."
+            elif p in (80, 443):
+                status = "ok"
+                detail = ("Используется порт 80/443 — это помогает обходить блокировки, "
+                          "но может мешать разделению трафика и диагностике.")
+            elif p in (22, 53, 3389):
+                status = "critical"
+                detail = (f"Используется порт {p}, который типично занят критичными сервисами "
+                          "(SSH/DNS/RDP). Высокий риск конфликтов и путаницы.")
+            else:
+                status = "ok"
+                detail = f"Используется нестандартный порт {p}. Убедитесь, что он не конфликтует с другими сервисами."
+        else:
+            status = "bad"
+            detail = "Параметр port не задан. Сервер будет использовать значение по умолчанию, лучше указать его явно."
+        results.append({"param": "port", "status": status, "detail": detail})
+    else:
+        if has_directive(directives, "remote"):
+            args = directives["remote"][0]
+            port = args[1] if len(args) >= 2 else None
+            try:
+                p = int(port) if port is not None else None
+            except (TypeError, ValueError):
+                p = None
+            if p is None:
+                status = "ok"
+                detail = ("В параметре remote порт явно не указан, будет использовано значение по умолчанию сервера.")
+            elif p == 1194:
+                status = "good"
+                detail = "Клиент подключается к стандартному порту OpenVPN 1194."
+            elif p in (80, 443):
+                status = "ok"
+                detail = ("Клиент подключается к порту 80/443 — помогает обходить блокировки, "
+                          "но стоит убедиться, что на этом порту действительно работает только OpenVPN.")
+            elif p in (22, 53, 3389):
+                status = "critical"
+                detail = (f"Клиент подключается к порту {p}, который обычно используется для SSH/DNS/RDP. "
+                          "Это нетипично и может указывать на рискованную конфигурацию.")
+            else:
+                status = "ok"
+                detail = f"Клиент подключается к нестандартному порту {p}. Это допустимо при корректной настройке сервера."
+            results.append({"param": "remote_port", "status": status, "detail": detail})
+
+    # topology
+    if has_directive(directives, "topology"):
+        topo = get_first_arg(directives, "topology")
+        tl = (topo or "").lower()
+        if tl == "subnet":
+            status = "good"
+            detail = ("topology subnet — один IP-адрес на клиента, проще настройка маршрутизации и firewall, "
+                      "оптимально для многопользовательского VPN.")
+        elif tl == "p2p":
+            status = "bad"
+            detail = ("topology p2p — подходит только для p2p-туннелей «точка-точка». "
+                      "Для многопользовательских конфигураций это неудачный выбор.")
+        elif tl == "net30":
+            status = "critical"
+            detail = "topology net30 — устаревший режим, не рекомендуется к использованию."
+        else:
+            status = "ok"
+            detail = f"Используется нетипичное значение topology {topo}. Проверьте необходимость."
+    else:
+        status = "ok"
+        detail = ("Параметр topology не задан, будет использовано значение по умолчанию. "
+                  "Рекомендуется явно указывать topology subnet в современных конфигурациях.")
+    results.append({"param": "topology", "status": status, "detail": detail})
+    return results
+
+def analyze_server_specific(directives: Dict[str, List[List[str]]]) -> List[Dict]:
+    results = []
+
+    # ifconfig-pool-persist
+    if has_directive(directives, "ifconfig-pool-persist"):
+        status = "good"
+        detail = ("ifconfig-pool-persist задан — сервер запоминает IP клиентов, "
+                  "что повышает управляемость и отслеживаемость подключений. "
+                  "Убедитесь, что файл находится в защищённом каталоге.")
+    else:
+        status = "bad"
+        detail = ("ifconfig-pool-persist отсутствует — IP клиентов при повторных подключениях "
+                  "могут меняться, что ухудшает управляемость и аудит.")
+    results.append({"param": "ifconfig-pool-persist", "status": status, "detail": detail})
+
+    pushes = list_pushes(directives)
+    has_redirect = any("redirect-gateway" in p for p in pushes)
+    has_dns_push = any("dhcp-option" in p.upper() and "DNS" in p.upper() for p in pushes)
+
+    # redirect-gateway
+    if has_redirect:
+        status = "good"
+        detail = ("Сервер пушит redirect-gateway def1 — весь трафик клиентов идёт через VPN, "
+                  "что повышает контроль и снижает риск обхода туннеля.")
+        if not has_dns_push:
+            status = "bad"
+            detail += (" Однако отсутствует push \"dhcp-option DNS ...\" — возможны DNS-утечки, "
+                       "рекомендуется задать доверенный DNS.")
+    else:
+        status = "ok"
+        detail = ("redirect-gateway def1 не используется. Клиенты могут выходить в интернет в режиме split-tunneling. "
+                  "Это нормально, если такой режим запланирован, но контроль над трафиком ниже.")
+    results.append({"param": "redirect-gateway", "status": status, "detail": detail})
+
+    # dhcp-option DNS
+    if has_dns_push:
+        status = "good"
+        detail = ("Параметр push \"dhcp-option DNS ...\" задан — клиентам выдаётся централизованный доверенный DNS.")
+    else:
+        status = "bad"
+        detail = ("Сервер не пушит параметр \"dhcp-option DNS ...\". "
+                  "Возможны DNS-утечки при использовании redirect-gateway. "
+                  "Рекомендуется задать доверенный DNS (например, адрес корпоративного DNS).")
+    results.append({"param": "dhcp-option DNS", "status": status, "detail": detail})
+
+    # client-to-client
+    if has_directive(directives, "client-to-client"):
+        status = "bad"
+        detail = ("Параметр client-to-client включён — клиенты могут напрямую обращаться друг к другу, "
+                  "что увеличивает поверхность атаки и позволяет сканировать соседей.")
+    else:
+        status = "good"
+        detail = ("Параметр client-to-client не используется — клиенты изолированы друг от друга на уровне сервера, "
+                  "что повышает безопасность.")
+    results.append({"param": "client-to-client", "status": status, "detail": detail})
+
+    # user / group
+    if has_directive(directives, "user") and has_directive(directives, "group"):
+        user = get_first_arg(directives, "user") or ""
+        group = get_first_arg(directives, "group") or ""
+        if user.lower() in {"nobody"} or group.lower() in {"nogroup", "nobody"}:
+            status = "good"
+            detail = ("Параметры user/group заданы и переводят демон OpenVPN на непривилегированного пользователя, "
+                      "что снижает последствия потенциального взлома.")
+        else:
+            status = "ok"
+            detail = (f"Параметры user ({user}) и group ({group}) заданы. "
+                      "Убедитесь, что это непривилегированный пользователь/группа.")
+    else:
+        status = "bad"
+        detail = ("Параметры user/group не заданы — OpenVPN демон продолжает работать с привилегиями root. "
+                  "Рекомендуется переводить его на непривилегированного пользователя.")
+    results.append({"param": "user/group", "status": status, "detail": detail})
+
+    # chroot
+    if has_directive(directives, "chroot"):
+        status = "good"
+        detail = ("Параметр chroot задан — процесс OpenVPN изолирован в отдельном каталоге (песочнице), "
+                  "что повышает безопасность.")
+    else:
+        status = "ok"
+        detail = ("Параметр chroot не используется. Это допустимо, но при повышенных требованиях безопасности "
+                  "рекомендуется рассмотреть использование chroot.")
+    results.append({"param": "chroot", "status": status, "detail": detail})
+
+    return results
+
+def analyze_tls_pki(directives: Dict[str, List[List[str]]], config_type: str) -> List[Dict]:
+    results = []
+    has_ca = has_directive(directives, "ca")
+    has_cert = has_directive(directives, "cert")
+    has_key = has_directive(directives, "key")
+    has_secret = has_directive(directives, "secret")
+
+    # PKI vs secret
+    if has_secret and not (has_ca or has_cert or has_key):
+        status = "critical"
+        detail = ("Используется только параметр secret (статический ключ) без PKI. "
+                  "Такой режим сильно уступает по безопасности полноценной PKI/сертификатам. "
+                  "Рекомендуется перейти на режим TLS с ca/cert/key.")
+    elif has_ca and has_cert and has_key:
+        status = "good"
+        detail = ("Настроен полноценный PKI-режим: заданы ca, cert, key. "
+                  "Это соответствует рекомендуемой схеме работы OpenVPN.")
+    else:
+        status = "bad"
+        detail = ("Параметры PKI заданы неполностью (ожидаются ca, cert и key). "
+                  "Рекомендуется проверить корректность конфигурации сертификатов.")
+    results.append({"param": "PKI (ca/cert/key/secret)", "status": status, "detail": detail})
+
+    # DH/ECDH
+    if has_directive(directives, "ecdh-curve"):
+        curve = " ".join(directives["ecdh-curve"][0])
+        status = "good"
+        detail = f"Используется ECDH с кривой {curve} — современный и производительный вариант обмена ключами."
+    elif has_directive(directives, "dh"):
+        status = "ok"
+        detail = ("Используются классические DH-параметры (dh). Это допустимо, "
+                  "но можно улучшить безопасность и производительность, перейдя на ECDH (ecdh-curve).")
+    else:
+        status = "bad"
+        detail = ("Не заданы ни dh, ни ecdh-curve. "
+                  "Убедитесь, что параметры обмена ключами заданы корректно (особенно для старых версий OpenVPN).")
+    results.append({"param": "DH/ECDH", "status": status, "detail": detail})
+
+    # tls-version-min
+    if has_directive(directives, "tls-version-min"):
+        ver = get_first_arg(directives, "tls-version-min") or ""
+        try:
+            v = float(ver)
+        except ValueError:
+            v = 0.0
+        if v >= 1.2:
+            status = "good"
+            detail = f"tls-version-min задан и запрещает TLS ниже {ver} — это соответствует современным требованиям."
+        else:
+            status = "critical"
+            detail = (f"tls-version-min задан как {ver}, что ниже 1.2. "
+                      "Рекомендуется запретить версии ниже TLS 1.2.")
+    else:
+        status = "critical"
+        detail = ("tls-version-min не задан — потенциально допускаются устаревшие версии TLS. "
+                  "Рекомендуется явно указать минимум 1.2.")
+    results.append({"param": "tls-version-min", "status": status, "detail": detail})
+
+    # tls-cipher / tls-ciphersuites
+    if has_directive(directives, "tls-cipher"):
+        arg_line = " ".join(directives["tls-cipher"][0])
+        status = "ok"
+        detail = ("Задан параметр tls-cipher (для TLS <1.3). "
+                  "Убедитесь, что список содержит только современные и стойкие шифросьюты:\n"
+                  f"{arg_line}")
+        results.append({"param": "tls-cipher", "status": status, "detail": detail})
+
+    if has_directive(directives, "tls-ciphersuites"):
+        arg_line = " ".join(directives["tls-ciphersuites"][0])
+        status = "ok"
+        detail = ("Задан параметр tls-ciphersuites (для TLS 1.3). "
+                  "Убедитесь, что список содержит только современные и стойкие шифросьюты:\n"
+                  f"{arg_line}")
+        results.append({"param": "tls-ciphersuites", "status": status, "detail": detail})
+
+    # tls-auth / tls-crypt
+    has_tls_auth = has_directive(directives, "tls-auth")
+    has_tls_crypt = has_directive(directives, "tls-crypt") or has_directive(directives, "tls-crypt-v2")
+    if has_tls_crypt:
+        status = "good"
+        detail = ("Используется tls-crypt/tls-crypt-v2 — control-канал шифруется и аутентифицируется, "
+                  "что затрудняет сканирование и атаки на управление.")
+    elif has_tls_auth:
+        status = "ok"
+        detail = ("Используется tls-auth — управляющие пакеты аутентифицируются, но не шифруются. "
+                  "Рекомендуется, по возможности, перейти на tls-crypt.")
+    else:
+        status = "critical"
+        detail = ("Не заданы tls-auth/tls-crypt/tls-crypt-v2. "
+                  "Control-канал не защищён дополнительным HMAC/шифрованием, "
+                  "что упрощает сканирование и атаки на сервер.")
+    results.append({"param": "tls-auth/tls-crypt", "status": status, "detail": detail})
+
+    # reneg-sec
+    if has_directive(directives, "reneg-sec"):
+        val = get_first_arg(directives, "reneg-sec")
+        try:
+            sec = int(val)
+        except (TypeError, ValueError):
+            sec = None
+        if sec is None:
+            status = "bad"
+            detail = "reneg-sec задан, но значение не распознано. Проверьте конфигурацию."
+        elif 3600 <= sec <= 86400:
+            status = "good"
+            detail = f"reneg-sec = {sec} секунд — разумный интервал пересогласования ключей."
+        elif sec > 86400:
+            status = "bad"
+            detail = (f"reneg-sec = {sec} секунд — слишком большой интервал. "
+                      "Рекомендуется уменьшить до диапазона 3600–86400 секунд.")
+        else:
+            status = "ok"
+            detail = (f"reneg-sec = {sec} секунд — довольно частое пересогласование. "
+                      "Это безопасно, но может влиять на производительность.")
+    else:
+        status = "critical"
+        detail = ("reneg-sec не задан. Рекомендуется явно задать разумный интервал (3600–86400 секунд).")
+    results.append({"param": "reneg-sec", "status": status, "detail": detail})
+
+    # параметры валидации сертификатов
+    if config_type == "server":
+        if has_directive(directives, "verify-client-cert"):
+            status = "good"
+            detail = "verify-client-cert включён — сервер проверяет клиентские сертификаты в соответствии с политикой."
+        else:
+            status = "bad"
+            detail = ("verify-client-cert не задан. Для строгой аутентификации клиентов "
+                      "рекомендуется настроить этот параметр.")
+        results.append({"param": "verify-client-cert", "status": status, "detail": detail})
+
+        if has_directive(directives, "crl-verify"):
+            status = "good"
+            detail = "Используется crl-verify — сервер проверяет, не отозван ли сертификат клиента."
+        else:
+            status = "bad"
+            detail = ("crl-verify не задан — сервер не проверяет отозванные сертификаты. "
+                      "Рекомендуется подключить список отзыва (CRL).")
+        results.append({"param": "crl-verify", "status": status, "detail": detail})
+
+        has_remote_cert_tls_client = any(
+            len(args) >= 1 and args[0].lower() == "client"
+            for args in directives.get("remote-cert-tls", [])
+        )
+        if has_remote_cert_tls_client:
+            status = "good"
+            detail = ("remote-cert-tls client задан — сервер дополнительно проверяет, "
+                      "что клиентский сертификат предназначен для client-аутентификации.")
+        elif has_directive(directives, "remote-cert-tls"):
+            status = "ok"
+            detail = "remote-cert-tls задан, но без параметра client. Проверьте корректность настроек."
+        else:
+            status = "bad"
+            detail = ("remote-cert-tls client не используется. "
+                      "Рекомендуется явно требовать использование клиентских сертификатов нужного типа.")
+        results.append({"param": "remote-cert-tls (server side)", "status": status, "detail": detail})
+    else:
+        has_remote_cert_tls_server = any(
+            len(args) >= 1 and args[0].lower() == "server"
+            for args in directives.get("remote-cert-tls", [])
+        )
+        if has_remote_cert_tls_server:
+            status = "good"
+            detail = ("remote-cert-tls server задан — клиент проверяет, что сертификат сервера "
+                      "предназначен именно для server-аутентификации.")
+        elif has_directive(directives, "remote-cert-tls"):
+            status = "ok"
+            detail = "remote-cert-tls задан, но без параметра server. Проверьте корректность настроек."
+        else:
+            status = "critical"
+            detail = ("remote-cert-tls server не задан — клиент может не корректно проверять тип сертификата сервера, "
+                      "что облегчает MITM-атаки. Настоятельно рекомендуется добавить remote-cert-tls server.")
+        results.append({"param": "remote-cert-tls (client side)", "status": status, "detail": detail})
+
+    return results
+
+def analyze_client_specific(directives: Dict[str, List[List[str]]]) -> List[Dict]:
+    results = []
+
+    # auth-user-pass
+    if has_directive(directives, "auth-user-pass"):
+        status = "good"
+        detail = ("Используется auth-user-pass — помимо сертификатов можно применять учётные записи пользователей.")
+    else:
+        status = "ok"
+        detail = ("auth-user-pass не используется. Это нормально при аутентификации только по сертификатам, "
+                  "но для удалённого доступа пользователей часто применяют и сертификат, и пароль.")
+    results.append({"param": "auth-user-pass", "status": status, "detail": detail})
+
+    # nobind
+    if has_directive(directives, "nobind"):
+        status = "good"
+        detail = ("Параметр nobind задан — клиент не привязывается к фиксированному локальному порту, "
+                  "что удобнее и безопаснее при работе за NAT.")
+    else:
+        status = "ok"
+        detail = ("Параметр nobind не задан — клиент может использовать фиксированный локальный порт. "
+                  "Это допустимо, но менее удобно при смене сетей/NAT.")
+    results.append({"param": "nobind", "status": status, "detail": detail})
+
+    # verify-x509-name
+    if has_directive(directives, "verify-x509-name"):
+        status = "good"
+        detail = "Параметр verify-x509-name задан — клиент дополнительно проверяет имя в сертификате сервера."
+    else:
+        status = "ok"
+        detail = ("verify-x509-name не используется. "
+                  "Рекомендуется включить его для дополнительной проверки подлинности сервера.")
+    results.append({"param": "verify-x509-name", "status": status, "detail": detail})
+
+    return results
+
+def summarize_results(results: List[Dict]) -> Dict:
+    summary = {"good": 0, "ok": 0, "bad": 0, "critical": 0}
+    worst = "good"
+    for r in results:
+        s = normalize_status(r.get("status"))
+        if s in summary:
+            summary[s] += 1
+        worst = status_worse(worst, s)
+    if worst == "good":
+        overall = "Конфигурация выглядит безопасной. Замечаний не найдено или они незначительные."
+    elif worst == "ok":
+        overall = ("Конфигурация в целом безопасна, но есть параметры, которые можно улучшить "
+                   "для повышения уровня защиты.")
+    elif worst == "bad":
+        overall = ("Обнаружены небезопасные параметры. "
+                   "Рекомендуется скорректировать конфигурацию в соответствии с рекомендациями.")
+    else:
+        overall = ("Обнаружены КРИТИЧЕСКИ НЕБЕЗОПАСНЫЕ параметры. "
+                   "Необходимо срочно скорректировать конфигурацию перед использованием в бою.")
+    return {"summary": summary, "worst": worst, "overall": overall}
+
+def format_report(config_type: str, results: List[Dict]) -> str:
+    header = []
+    if config_type == "server":
+        header.append("Тип конфигурации: СЕРВЕР OpenVPN")
+    elif config_type == "client":
+        header.append("Тип конфигурации: КЛИЕНТ OpenVPN")
+    else:
+        header.append("Тип конфигурации: НЕ ОПРЕДЕЛЁН (анализ выполнен как общий)")
+
+    summ = summarize_results(results)
+    header.append("")
+    header.append("ИТОГОВАЯ РЕЗОЛЮЦИЯ:")
+    header.append(summ["overall"])
+    header.append(f"- Параметров в состоянии 'Хорошо': {summ['summary']['good']}")
+    header.append(f"- Параметров в состоянии 'Нормально (можно улучшить)': {summ['summary']['ok']}")
+    header.append(f"- Параметров в состоянии 'Плохо': {summ['summary']['bad']}")
+    header.append(f"- Параметров в состоянии 'Критично плохо': {summ['summary']['critical']}")
+    header.append("")
+    header.append("Детальный отчёт по параметрам:")
+
+    lines = []
+    for r in results:
+        s = normalize_status(r.get("status"))
+        status_rus = {
+            "good": "ХОРОШО",
+            "ok": "НОРМАЛЬНО (МОЖНО УЛУЧШИТЬ)",
+            "bad": "ПЛОХО",
+            "critical": "КРИТИЧНО ПЛОХО",
+        }.get(s, s)
+        lines.append(f"[{status_rus}] {r['param']}")
+        lines.append(f"    {r['detail']}")
+        lines.append("")
+    return "\n".join(header + lines)
+
+def analyze_openvpn_config_text(text: str) -> str:
+    _, directives = parse_openvpn_config(text)
+    ctype = detect_config_type(directives)
+    results: List[Dict] = []
+    results.extend(analyze_common_network(directives, ctype))
+    results.extend(analyze_common_crypto(directives))
+    results.extend(analyze_tls_pki(directives, ctype))
+    if ctype == "server":
+        results.extend(analyze_server_specific(directives))
+    elif ctype == "client":
+        results.extend(analyze_client_specific(directives))
+    else:
+        serv = analyze_server_specific(directives)
+        for r in serv:
+            r["param"] += " (считаем, что это серверный параметр)"
+        results.extend(serv)
+        cli = analyze_client_specific(directives)
+        for r in cli:
+            r["param"] += " (считаем, что это клиентский параметр)"
+        results.extend(cli)
+    return format_report(ctype, results)
+
+# ---------------- GUI ----------------
+
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from tkinter.scrolledtext import ScrolledText
+
+def run_gui():
+    root = tk.Tk()
+    root.title("OpenVPN Security Analyzer")
+    root.geometry("900x700")
+
+    lbl = tk.Label(root, text="Выберите файл конфигурации OpenVPN (.conf / .ovpn)", anchor="w")
+    lbl.pack(fill="x", padx=10, pady=5)
+
+    frame_btn = tk.Frame(root)
+    frame_btn.pack(fill="x", padx=10, pady=5)
+
+    path_var = tk.StringVar()
+    type_var = tk.StringVar()
+
+    txt = ScrolledText(root, wrap="word")
+    txt.pack(fill="both", expand=True, padx=10, pady=5)
+    txt.insert(tk.END, "Загрузите файл конфигурации OpenVPN, чтобы получить отчёт по безопасности...\n")
+
+    def choose_file():
+        filename = filedialog.askopenfilename(
+            title="Выбор конфигурационного файла OpenVPN",
+            filetypes=(
+                ("OpenVPN config", "*.conf *.ovpn *.txt"),
+                ("All files", "*.*"),
+            ),
+        )
+        if not filename:
+            return
+        path_var.set(filename)
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                text = f.read()
+        except UnicodeDecodeError:
+            with open(filename, "r", encoding="cp1251", errors="ignore") as f:
+                text = f.read()
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось прочитать файл:\n{e}")
+            return
+        report = analyze_openvpn_config_text(text)
+        txt.delete("1.0", tk.END)
+        txt.insert(tk.END, report)
+        first_line = report.splitlines()[0] if report else ""
+        type_var.set(first_line)
+
+    def copy_report():
+        report = txt.get("1.0", tk.END)
+        root.clipboard_clear()
+        root.clipboard_append(report)
+        messagebox.showinfo("Готово", "Отчёт скопирован в буфер обмена.")
+
+    btn_open = tk.Button(frame_btn, text="Открыть конфиг...", command=choose_file)
+    btn_open.pack(side="left")
+
+    btn_copy = tk.Button(frame_btn, text="Копировать отчёт", command=copy_report)
+    btn_copy.pack(side="left", padx=5)
+
+    path_lbl = tk.Label(root, textvariable=path_var, anchor="w", fg="gray")
+    path_lbl.pack(fill="x", padx=10, pady=2)
+
+    type_lbl = tk.Label(root, textvariable=type_var, anchor="w", fg="blue")
+    type_lbl.pack(fill="x", padx=10, pady=2)
+
+    root.mainloop()
+
+if __name__ == "__main__":
+    run_gui()
