@@ -39,27 +39,27 @@ def summarize_results(results: List[Dict]) -> Dict:
                    "Рекомендуется скорректировать конфигурацию в соответствии с рекомендациями.")
     else:
         overall = ("Обнаружены КРИТИЧЕСКИ НЕБЕЗОПАСНЫЕ параметры. "
-                   "Необходимо срочно скорректировать конфигурацию перед использованием в бою.")
+                   "Необходимо срочно скорректировать конфигурацию перед использованием.")
     return {"summary": summary, "worst": worst, "overall": overall}
 
 
 def format_report(vpn_name: str, config_type: str, results: List[Dict]) -> str:
     header: List[str] = []
     if config_type == "server":
-        header.append(f"Тип конфигурации: СЕРВЕР {vpn_name}")
+        header.append(f"Тип конфигурации: Серверная конфигурация {vpn_name}")
     elif config_type == "client":
-        header.append(f"Тип конфигурации: КЛИЕНТ {vpn_name}")
+        header.append(f"Тип конфигурации: Клиентская конфигурация {vpn_name}")
     else:
-        header.append(f"Тип конфигурации: НЕ ОПРЕДЕЛЁН ({vpn_name})")
+        header.append(f"Тип конфигурации: Не определен ({vpn_name})")
 
     summ = summarize_results(results)
     header.append("")
     header.append("ИТОГОВАЯ РЕЗОЛЮЦИЯ:")
     header.append(summ["overall"])
     header.append(f"- Параметров в состоянии 'Хорошо': {summ['summary']['good']}")
-    header.append(f"- Параметров в состоянии 'Нормально (можно улучшить)': {summ['summary']['ok']}")
+    header.append(f"- Параметров в состоянии 'Удовлетворительн,но можно улучшить': {summ['summary']['ok']}")
     header.append(f"- Параметров в состоянии 'Плохо': {summ['summary']['bad']}")
-    header.append(f"- Параметров в состоянии 'Критично плохо': {summ['summary']['critical']}")
+    header.append(f"- Параметров в состоянии 'Критично': {summ['summary']['critical']}")
     header.append("")
     header.append("Детальный отчёт по параметрам:")
 
@@ -67,10 +67,10 @@ def format_report(vpn_name: str, config_type: str, results: List[Dict]) -> str:
     for r in results:
         s = normalize_status(r.get("status"))
         status_rus = {
-            "good": "ХОРОШО",
-            "ok": "НОРМАЛЬНО (МОЖНО УЛУЧШИТЬ)",
-            "bad": "ПЛОХО",
-            "critical": "КРИТИЧНО ПЛОХО",
+            "good": "Хорошо",
+            "ok": "Удовлетворительно , но можно улучшить",
+            "bad": "Плохо",
+            "critical": "Критично",
         }.get(s, s)
         lines.append(f"[{status_rus}] {r['param']}")
         lines.append(f"    {r['detail']}")
@@ -954,7 +954,7 @@ from tkinter.scrolledtext import ScrolledText
 
 def run_gui():
     root = tk.Tk()
-    root.title("VPN Security Analyzer (OpenVPN & WireGuard)")
+    root.title("Система анализа конфигурай VPN")
     root.geometry("950x750")
 
     # --- верхняя панель: выбор типа VPN ---
