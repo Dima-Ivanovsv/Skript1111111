@@ -1538,11 +1538,11 @@ def analyze_wireguard_config_text(text):
 
 def run_gui():
     main_win = tk.Tk()
-    main_win.title("VPN Security Analyzer (OpenVPN & WireGuard)")
+    main_win.title("VPN Security Analyzer (Система анализа безопасности конфигураций)")
     main_win.geometry("950x750")
 
     # заголовок
-    title_lbl = ttk.Label(main_win, text="Анализ безопасности конфигураций VPN", font=("Segoe UI", 14, "bold"))
+    title_lbl = ttk.Label(main_win, text="Программное средство разработанное для защиты ВКР", font=("Segoe UI", 14, "bold"))
     title_lbl.pack(pady=(10, 0))
 
     subtitle_lbl = ttk.Label(main_win, text="Поддерживаются OpenVPN и WireGuard", font=("Segoe UI", 10))
