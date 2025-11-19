@@ -1,0 +1,1141 @@
+import re
+from typing import List, Dict, Tuple
+
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from tkinter.scrolledtext import ScrolledText
+from tkinter import ttk
+
+# ---- Общие помощники ----
+
+STATUS_ORDER = ["good", "ok", "bad", "critical"]
+
+
+def normalize_status(s: str) -> str:
+    if not s:
+        return "ok"
+    s = s.strip().lower()
+    if s not in STATUS_ORDER:
+        return "ok"
+    return s
+
+
+def status_worse(a: str, b: str) -> str:
+    a = normalize_status(a)
+    b = normalize_status(b)
+    return a if STATUS_ORDER.index(a) > STATUS_ORDER.index(b) else b
+
+
+def summarize_results(results: List[Dict]) -> Dict:
+    summary = {"good": 0, "ok": 0, "bad": 0, "critical": 0}
+    worst = "good"
+    for r in results:
+        s = normalize_status(r.get("status"))
+        if s in summary:
+            summary[s] += 1
+        worst = status_worse(worst, s)
+    if worst == "good":
+        overall = "Конфигурация выглядит безопасной. Замечаний не найдено или они незначительные."
+    elif worst == "ok":
+        overall = ("Конфигурация в целом безопасна, но есть параметры, которые можно улучшить "
+                   "для повышения уровня защиты.")
+    elif worst == "bad":
+        overall = ("Обнаружены небезопасные параметры. "
+                   "Рекомендуется скорректировать конфигурацию в соответствии с рекомендациями.")
+    else:
+        overall = ("Обнаружены КРИТИЧЕСКИ НЕБЕЗОПАСНЫЕ параметры. "
+                   "Необходимо срочно скорректировать конфигурацию перед использованием в бою.")
+    return {"summary": summary, "worst": worst, "overall": overall}
+
+
+def format_report(vpn_name: str, config_type: str, results: List[Dict]) -> str:
+    header: List[str] = []
+    if config_type == "server":
+        header.append(f"Тип конфигурации: СЕРВЕР {vpn_name}")
+    elif config_type == "client":
+        header.append(f"Тип конфигурации: КЛИЕНТ {vpn_name}")
+    else:
+        header.append(f"Тип конфигурации: НЕ ОПРЕДЕЛЁН ({vpn_name})")
+
+    summ = summarize_results(results)
+    header.append("")
+    header.append("ИТОГОВАЯ РЕЗОЛЮЦИЯ:")
+    header.append(summ["overall"])
+    header.append(f"- Параметров в состоянии 'Хорошо': {summ['summary']['good']}")
+    header.append(f"- Параметров в состоянии 'Нормально (можно улучшить)': {summ['summary']['ok']}")
+    header.append(f"- Параметров в состоянии 'Плохо': {summ['summary']['bad']}")
+    header.append(f"- Параметров в состоянии 'Критично плохо': {summ['summary']['critical']}")
+    header.append("")
+    header.append("Детальный отчёт по параметрам:")
+
+    lines: List[str] = []
+    for r in results:
+        s = normalize_status(r.get("status"))
+        status_rus = {
+            "good": "ХОРОШО",
+            "ok": "НОРМАЛЬНО (МОЖНО УЛУЧШИТЬ)",
+            "bad": "ПЛОХО",
+            "critical": "КРИТИЧНО ПЛОХО",
+        }.get(s, s)
+        lines.append(f"[{status_rus}] {r['param']}")
+        lines.append(f"    {r['detail']}")
+        lines.append("")
+
+    return "\n".join(header + lines)
+
+
+# ==== OpenVPN ====
+
+def parse_openvpn_config(text: str) -> Tuple[List[Tuple[str, List[str]]], Dict[str, List[List[str]]]]:
+    entries: List[Tuple[str, List[str]]] = []
+    directives: Dict[str, List[List[str]]] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+        # отрезаем инлайновые комментарии, если они не в кавычках
+        for sep in ("#", ";"):
+            if sep in line:
+                parts = line.split(sep, 1)
+                if parts[0].count('"') % 2 == 0 and parts[0].count("'") % 2 == 0:
+                    line = parts[0].strip()
+        if not line:
+            continue
+        tokens = line.split()
+        key = tokens[0].lower()
+        args = tokens[1:]
+        entries.append((key, args))
+        directives.setdefault(key, []).append(args)
+    return entries, directives
+
+
+def has_directive(directives: Dict[str, List[List[str]]], name: str) -> bool:
+    return name.lower() in directives
+
+
+def get_first_arg(directives: Dict[str, List[List[str]]], name: str):
+    name = name.lower()
+    if name in directives and directives[name]:
+        if directives[name][0]:
+            return directives[name][0][0]
+    return None
+
+
+def list_pushes(directives: Dict[str, List[List[str]]]) -> List[str]:
+    return [" ".join(args) for args in directives.get("push", [])]
+
+
+def detect_openvpn_type(directives: Dict[str, List[List[str]]]) -> str:
+    if has_directive(directives, "server") or has_directive(directives, "server-bridge"):
+        return "server"
+    if has_directive(directives, "client"):
+        return "client"
+    server_ind = {"server", "server-bridge", "ifconfig-pool-persist", "push",
+                  "duplicate-cn", "verify-client-cert", "crl-verify", "client-to-client"}
+    client_ind = {"remote", "auth-user-pass", "nobind", "remote-cert-tls"}
+    s_score = sum(1 for k in server_ind if has_directive(directives, k))
+    c_score = sum(1 for k in client_ind if has_directive(directives, k))
+    if s_score > c_score:
+        return "server"
+    if c_score > s_score:
+        return "client"
+    return "unknown"
+
+
+def analyze_common_network_openvpn(directives: Dict[str, List[List[str]]], config_type: str) -> List[Dict]:
+    results: List[Dict] = []
+
+    # proto
+    if has_directive(directives, "proto"):
+        proto = get_first_arg(directives, "proto")
+        pl = (proto or "").lower()
+        if pl.startswith("udp"):
+            status = "good"
+            detail = "Используется proto UDP — предпочтителен по производительности и устойчивости к DoS."
+        elif pl.startswith("tcp"):
+            status = "bad"
+            detail = "Используется proto TCP. Это работает, но увеличивает чувствительность к DoS и задержкам."
+        else:
+            status = "ok"
+            detail = f"Используется нетипичный протокол '{proto}'. Проверьте необходимость."
+    else:
+        status = "bad"
+        detail = "Параметр proto не задан. Рекомендуется явно указать proto udp."
+    results.append({"param": "proto", "status": status, "detail": detail})
+
+    # dev
+    if has_directive(directives, "dev"):
+        dev = get_first_arg(directives, "dev")
+        dl = (dev or "").lower()
+        if dl == "tun":
+            status = "good"
+            detail = "dev tun — рекомендованный режим (маршрутизация IP, проще фильтрация)."
+        elif dl == "tap":
+            status = "bad"
+            detail = "dev tap — пробрасывает L2, расширяет поверхность атаки. Используйте только при явной необходимости."
+        else:
+            status = "ok"
+            detail = f"Используется нетипичный интерфейс dev {dev}. Проверьте, что он действительно нужен."
+    else:
+        status = "critical"
+        detail = "Параметр dev не задан. Рекомендуется явно указать dev tun."
+    results.append({"param": "dev", "status": status, "detail": detail})
+
+    # port / remote port
+    if config_type == "server":
+        if has_directive(directives, "port"):
+            port = get_first_arg(directives, "port")
+            try:
+                p = int(port)
+            except (TypeError, ValueError):
+                p = None
+            if p == 1194:
+                status = "good"
+                detail = "Сервер слушает стандартный порт OpenVPN 1194."
+            elif p in (80, 443):
+                status = "ok"
+                detail = "Сервер слушает порт 80/443 — помогает обходить блокировки, но аккуратно с разделением трафика."
+            elif p in (22, 53, 3389):
+                status = "critical"
+                detail = f"Сервер слушает критичный сервисный порт {p} (SSH/DNS/RDP). Это крайне не рекомендуется."
+            else:
+                status = "ok"
+                detail = f"Сервер слушает нестандартный порт {p}. Убедитесь, что он не конфликтует с другими сервисами."
+        else:
+            status = "bad"
+            detail = "Параметр port не задан. Лучше указать порт явно."
+        results.append({"param": "port", "status": status, "detail": detail})
+    else:
+        if has_directive(directives, "remote"):
+            args = directives["remote"][0]
+            port = args[1] if len(args) >= 2 else None
+            try:
+                p = int(port) if port is not None else None
+            except (TypeError, ValueError):
+                p = None
+            if p is None:
+                status = "ok"
+                detail = "В remote порт не указан, будет использован порт по умолчанию сервера."
+            elif p == 1194:
+                status = "good"
+                detail = "Клиент подключается к стандартному порту 1194."
+            elif p in (80, 443):
+                status = "ok"
+                detail = "Клиент подключается к порту 80/443 — это удобно при блокировках, но требует аккуратной настройки."
+            elif p in (22, 53, 3389):
+                status = "critical"
+                detail = f"Клиент подключается к порту {p} (SSH/DNS/RDP). Это нетипично и потенциально опасно."
+            else:
+                status = "ok"
+                detail = f"Клиент подключается к нестандартному порту {p}. Убедитесь, что это ожидаемое поведение."
+            results.append({"param": "remote_port", "status": status, "detail": detail})
+
+    # topology
+    if has_directive(directives, "topology"):
+        topo = get_first_arg(directives, "topology")
+        tl = (topo or "").lower()
+        if tl == "subnet":
+            status = "good"
+            detail = "topology subnet — современный и рекомендуемый режим."
+        elif tl == "p2p":
+            status = "bad"
+            detail = "topology p2p — подходит только для p2p-связей, не для многопользовательского VPN."
+        elif tl == "net30":
+            status = "critical"
+            detail = "topology net30 — устаревший режим, не рекомендуется."
+        else:
+            status = "ok"
+            detail = f"Используется нетипичное значение topology {topo}. Проверьте необходимость."
+    else:
+        status = "ok"
+        detail = "topology не задан, используется значение по умолчанию. Лучше явно указать topology subnet."
+    results.append({"param": "topology", "status": status, "detail": detail})
+
+    return results
+
+
+def analyze_common_crypto_openvpn(directives: Dict[str, List[List[str]]]) -> List[Dict]:
+    results: List[Dict] = []
+    modern_good = {"aes-256-gcm", "aes-128-gcm", "chacha20-poly1305"}
+    old_ok = {"aes-256-cbc", "aes-192-gcm", "aes-128-cbc"}
+    very_bad = {"bf-cbc", "des-cbc", "des-ede3-cbc", "none"}
+
+    # data-ciphers
+    if has_directive(directives, "data-ciphers"):
+        arg_line = " ".join(directives["data-ciphers"][0])
+        ciphers = {c.strip().lower() for c in re.split(r"[,\s]+", arg_line) if c.strip()}
+        if ciphers & very_bad:
+            status = "critical"
+            detail = ("data-ciphers содержит небезопасные шифры: "
+                      f"{', '.join(sorted(ciphers & very_bad)).upper()}. Уберите их немедленно.")
+        elif (ciphers & old_ok) and not (ciphers & modern_good):
+            status = "bad"
+            detail = ("Используются только устаревшие шифры "
+                      f"{', '.join(sorted(ciphers & old_ok)).upper()}. "
+                      "Рекомендуется перейти на AES-GCM или CHACHA20-POLY1305.")
+        elif ciphers & modern_good:
+            status = "good"
+            detail = ("data-ciphers содержит современные шифры: "
+                      f"{', '.join(sorted(ciphers & modern_good)).upper()}.")
+        else:
+            status = "ok"
+            detail = "data-ciphers задан, но набор шифров нестандартный. Проверьте их стойкость."
+    else:
+        status = "bad"
+        detail = ("data-ciphers не задан. Лучше явно указать современные шифры "
+                  "(AES-256-GCM/AES-128-GCM/CHACHA20-POLY1305).")
+    results.append({"param": "data-ciphers", "status": status, "detail": detail})
+
+    # data-ciphers-fallback
+    if has_directive(directives, "data-ciphers-fallback"):
+        status = "good"
+        detail = "data-ciphers-fallback задан — обеспечивает совместимость со старыми клиентами."
+    else:
+        status = "bad"
+        detail = ("data-ciphers-fallback не задан. При наличии старых клиентов возможны проблемы совместимости, "
+                  "рекомендуется указать безопасный резервный шифр (например AES-256-CBC).")
+    results.append({"param": "data-ciphers-fallback", "status": status, "detail": detail})
+
+    # cipher (legacy)
+    if has_directive(directives, "cipher"):
+        status = "critical"
+        detail = ("Обнаружен устаревший параметр cipher. Современные конфигурации должны использовать "
+                  "data-ciphers/data-ciphers-fallback. Рекомендуется удалить cipher.")
+        results.append({"param": "cipher", "status": status, "detail": detail})
+
+    # auth
+    if has_directive(directives, "auth"):
+        alg = get_first_arg(directives, "auth")
+        alg_low = (alg or "").lower()
+        if alg_low in {"sha256", "sha384", "sha512"}:
+            status = "good"
+            detail = f"Используется современный HMAC-алгоритм {alg.upper()}."
+        elif alg_low in {"md5", "sha1"}:
+            status = "bad"
+            detail = (f"Используется устаревший HMAC-алгоритм {alg.upper()}. "
+                      "Рекомендуется перейти на SHA256/384/512.")
+        else:
+            status = "ok"
+            detail = f"auth = {alg.upper()}, проверьте стойкость этого алгоритма."
+    else:
+        status = "bad"
+        detail = "auth не задан. Лучше явно указать современный алгоритм (например, SHA256)."
+    results.append({"param": "auth", "status": status, "detail": detail})
+
+    # replay-window
+    if has_directive(directives, "replay-window"):
+        status = "good"
+        detail = "replay-window задан — защита от повторных пакетов настроена явно."
+    else:
+        status = "bad"
+        detail = "replay-window не задан. Используется значение по умолчанию, лучше задать его явно."
+    results.append({"param": "replay-window", "status": status, "detail": detail})
+
+    # mute-replay-warnings
+    if has_directive(directives, "mute-replay-warnings"):
+        status = "bad"
+        detail = "mute-replay-warnings отключает предупреждения о повторных пакетах — это осложняет расследование инцидентов."
+        results.append({"param": "mute-replay-warnings", "status": status, "detail": detail})
+
+    return results
+
+
+def analyze_server_specific_openvpn(directives: Dict[str, List[List[str]]]) -> List[Dict]:
+    results: List[Dict] = []
+
+    # ifconfig-pool-persist
+    if has_directive(directives, "ifconfig-pool-persist"):
+        status = "good"
+        detail = "ifconfig-pool-persist задан — IP клиентов фиксируются, что облегчает аудит."
+    else:
+        status = "bad"
+        detail = "ifconfig-pool-persist отсутствует — IP клиентов могут постоянно меняться, аудит сложнее."
+    results.append({"param": "ifconfig-pool-persist", "status": status, "detail": detail})
+
+    pushes = list_pushes(directives)
+    has_redirect = any("redirect-gateway" in p for p in pushes)
+    has_dns_push = any("dhcp-option" in p.upper() and "DNS" in p.upper() for p in pushes)
+
+    # redirect-gateway
+    if has_redirect:
+        status = "good"
+        detail = "Сервер пушит redirect-gateway def1 — весь трафик клиентов идёт через VPN."
+        if not has_dns_push:
+            status = "bad"
+            detail += " Но отсутствует push \"dhcp-option DNS ...\" — возможны DNS-утечки."
+    else:
+        status = "ok"
+        detail = "redirect-gateway def1 не используется. Клиенты работают в режиме split-tunnel."
+    results.append({"param": "redirect-gateway", "status": status, "detail": detail})
+
+    # dhcp-option DNS
+    if has_dns_push:
+        status = "good"
+        detail = "push \"dhcp-option DNS ...\" задан — клиентам выдаётся доверенный DNS."
+    else:
+        status = "bad"
+        detail = "Сервер не пушит \"dhcp-option DNS ...\". Возможны DNS-утечки при полном туннеле."
+    results.append({"param": "dhcp-option DNS", "status": status, "detail": detail})
+
+    # client-to-client
+    if has_directive(directives, "client-to-client"):
+        status = "bad"
+        detail = "client-to-client включён — клиенты могут видеть друг друга и сканировать соседей."
+    else:
+        status = "good"
+        detail = "client-to-client отключён — клиенты изолированы друг от друга."
+    results.append({"param": "client-to-client", "status": status, "detail": detail})
+
+    # user / group
+    if has_directive(directives, "user") and has_directive(directives, "group"):
+        user = get_first_arg(directives, "user") or ""
+        group = get_first_arg(directives, "group") or ""
+        if user.lower() == "nobody" and group.lower() in {"nogroup", "nobody"}:
+            status = "good"
+            detail = "user/group переводят демон OpenVPN на непривилегированного пользователя."
+        else:
+            status = "ok"
+            detail = f"user={user}, group={group}. Убедитесь, что это непривилегированный пользователь/группа."
+    else:
+        status = "bad"
+        detail = "user/group не заданы — OpenVPN работает с привилегиями root."
+    results.append({"param": "user/group", "status": status, "detail": detail})
+
+    # chroot
+    if has_directive(directives, "chroot"):
+        status = "good"
+        detail = "chroot задан — процесс OpenVPN изолирован в отдельном каталоге."
+    else:
+        status = "ok"
+        detail = "chroot не используется. Для повышенных требований безопасности стоит рассмотреть его включение."
+    results.append({"param": "chroot", "status": status, "detail": detail})
+
+    return results
+
+
+def analyze_tls_pki_openvpn(directives: Dict[str, List[List[str]]], config_type: str) -> List[Dict]:
+    results: List[Dict] = []
+
+    has_ca = has_directive(directives, "ca")
+    has_cert = has_directive(directives, "cert")
+    has_key = has_directive(directives, "key")
+    has_secret = has_directive(directives, "secret")
+
+    # PKI vs static key
+    if has_secret and not (has_ca or has_cert or has_key):
+        status = "critical"
+        detail = ("Используется только static key (secret) без полноценной PKI. "
+                  "Рекомендуется перейти на режим TLS с ca/cert/key.")
+    elif has_ca and has_cert and has_key:
+        status = "good"
+        detail = "Настроен полнофункциональный PKI-режим: заданы ca, cert, key."
+    else:
+        status = "bad"
+        detail = "Набор параметров PKI заданы неполностью. Ожидаются ca, cert и key."
+    results.append({"param": "PKI (ca/cert/key/secret)", "status": status, "detail": detail})
+
+    # DH/ECDH
+    if has_directive(directives, "ecdh-curve"):
+        curve = " ".join(directives["ecdh-curve"][0])
+        status = "good"
+        detail = f"Используется ECDH (ecdh-curve {curve}) — современный и производительный обмен ключами."
+    elif has_directive(directives, "dh"):
+        status = "ok"
+        detail = "Используются классические DH-параметры. Это допустимо, но ECDH обычно предпочтительнее."
+    else:
+        status = "bad"
+        detail = "Не заданы ни dh, ни ecdh-curve. Проверьте параметры обмена ключами."
+    results.append({"param": "DH/ECDH", "status": status, "detail": detail})
+
+    # tls-version-min
+    if has_directive(directives, "tls-version-min"):
+        ver = get_first_arg(directives, "tls-version-min") or ""
+        try:
+            v = float(ver)
+        except ValueError:
+            v = 0.0
+        if v >= 1.2:
+            status = "good"
+            detail = f"tls-version-min = {ver} — версии ниже TLS 1.2 запрещены."
+        else:
+            status = "critical"
+            detail = f"tls-version-min = {ver} — допускается TLS ниже 1.2, что небезопасно."
+    else:
+        status = "critical"
+        detail = "tls-version-min не задан — потенциально допускаются устаревшие версии TLS."
+    results.append({"param": "tls-version-min", "status": status, "detail": detail})
+
+    # tls-cipher / tls-ciphersuites (без детальной проверки списка)
+    if has_directive(directives, "tls-cipher"):
+        arg_line = " ".join(directives["tls-cipher"][0])
+        status = "ok"
+        detail = ("tls-cipher задан. Убедитесь, что в списке только современные стойкие шифросьюты: "
+                  f"{arg_line}")
+        results.append({"param": "tls-cipher", "status": status, "detail": detail})
+    if has_directive(directives, "tls-ciphersuites"):
+        arg_line = " ".join(directives["tls-ciphersuites"][0])
+        status = "ok"
+        detail = ("tls-ciphersuites (TLS 1.3) задан. Проверьте, что используются только современные "
+                  f"шифросьюты: {arg_line}")
+        results.append({"param": "tls-ciphersuites", "status": status, "detail": detail})
+
+    # tls-auth / tls-crypt
+    has_tls_auth = has_directive(directives, "tls-auth")
+    has_tls_crypt = has_directive(directives, "tls-crypt") or has_directive(directives, "tls-crypt-v2")
+    if has_tls_crypt:
+        status = "good"
+        detail = "Используется tls-crypt/tls-crypt-v2 — управляющий канал шифруется и аутентифицируется."
+    elif has_tls_auth:
+        status = "ok"
+        detail = "Используется tls-auth — управляющий канал аутентифицируется, но не шифруется. Лучше tls-crypt."
+    else:
+        status = "critical"
+        detail = "Не используются tls-auth/tls-crypt — управляющий канал не защищён дополнительным ключом."
+    results.append({"param": "tls-auth/tls-crypt", "status": status, "detail": detail})
+
+    # reneg-sec
+    if has_directive(directives, "reneg-sec"):
+        val = get_first_arg(directives, "reneg-sec")
+        try:
+            sec = int(val)
+        except (TypeError, ValueError):
+            sec = None
+        if sec is None:
+            status = "bad"
+            detail = "reneg-sec задан, но не удалось интерпретировать значение."
+        elif 3600 <= sec <= 86400:
+            status = "good"
+            detail = f"reneg-sec = {sec} — разумный интервал пересогласования ключей."
+        elif sec > 86400:
+            status = "bad"
+            detail = f"reneg-sec = {sec} — слишком большой интервал. Рекомендуется уменьшить."
+        else:
+            status = "ok"
+            detail = f"reneg-sec = {sec} — очень частое пересогласование. Это безопасно, но может влиять на производительность."
+    else:
+        status = "critical"
+        detail = "reneg-sec не задан. Рекомендуется явно задать интервал (3600–86400 секунд)."
+    results.append({"param": "reneg-sec", "status": status, "detail": detail})
+
+    # verify-client-cert / crl-verify / remote-cert-tls
+    if config_type == "server":
+        if has_directive(directives, "verify-client-cert"):
+            status = "good"
+            detail = "verify-client-cert задан — сервер проверяет клиентские сертификаты."
+        else:
+            status = "bad"
+            detail = "verify-client-cert не задан. Рекомендуется настроить строгую проверку клиентских сертификатов."
+        results.append({"param": "verify-client-cert", "status": status, "detail": detail})
+
+        if has_directive(directives, "crl-verify"):
+            status = "good"
+            detail = "crl-verify используется — сервер проверяет отозванные сертификаты."
+        else:
+            status = "bad"
+            detail = "crl-verify не задан — отозванные сертификаты не проверяются."
+        results.append({"param": "crl-verify", "status": status, "detail": detail})
+
+        has_remote_cert_tls_client = any(
+            len(args) >= 1 and args[0].lower() == "client"
+            for args in directives.get("remote-cert-tls", [])
+        )
+        if has_remote_cert_tls_client:
+            status = "good"
+            detail = "remote-cert-tls client — сервер проверяет тип клиентского сертификата."
+        elif has_directive(directives, "remote-cert-tls"):
+            status = "ok"
+            detail = "remote-cert-tls задан, но без параметра client. Проверьте корректность."
+        else:
+            status = "bad"
+            detail = "remote-cert-tls client не используется. Рекомендуется включить."
+        results.append({"param": "remote-cert-tls (server side)", "status": status, "detail": detail})
+    else:
+        has_remote_cert_tls_server = any(
+            len(args) >= 1 and args[0].lower() == "server"
+            for args in directives.get("remote-cert-tls", [])
+        )
+        if has_remote_cert_tls_server:
+            status = "good"
+            detail = "remote-cert-tls server — клиент проверяет, что сертификат принадлежит серверу."
+        elif has_directive(directives, "remote-cert-tls"):
+            status = "ok"
+            detail = "remote-cert-tls задан, но без server. Проверьте корректность."
+        else:
+            status = "critical"
+            detail = "remote-cert-tls server не задан — клиент может не проверять тип сертификата сервера."
+        results.append({"param": "remote-cert-tls (client side)", "status": status, "detail": detail})
+
+    return results
+
+
+def analyze_client_specific_openvpn(directives: Dict[str, List[List[str]]]) -> List[Dict]:
+    results: List[Dict] = []
+
+    # auth-user-pass
+    if has_directive(directives, "auth-user-pass"):
+        status = "good"
+        detail = "auth-user-pass используется — кроме сертификатов есть парольная аутентификация."
+    else:
+        status = "ok"
+        detail = "auth-user-pass не используется. Допустимо при аутентификации только по сертификатам."
+    results.append({"param": "auth-user-pass", "status": status, "detail": detail})
+
+    # nobind
+    if has_directive(directives, "nobind"):
+        status = "good"
+        detail = "nobind — клиент не привязывается к фиксированному локальному порту, удобно при работе за NAT."
+    else:
+        status = "ok"
+        detail = "nobind не задан — клиент может использовать фиксированный локальный порт."
+    results.append({"param": "nobind", "status": status, "detail": detail})
+
+    # verify-x509-name
+    if has_directive(directives, "verify-x509-name"):
+        status = "good"
+        detail = "verify-x509-name используется — клиент дополнительно проверяет имя в сертификате сервера."
+    else:
+        status = "ok"
+        detail = "verify-x509-name не используется. Рекомендуется включить для дополнительной проверки сервера."
+    results.append({"param": "verify-x509-name", "status": status, "detail": detail})
+
+    return results
+
+
+def analyze_access_control_openvpn(directives: Dict[str, List[List[str]]], config_type: str) -> List[Dict]:
+    """Анализ duplicate-cn только для серверных конфигураций."""
+    results: List[Dict] = []
+    if config_type == "server":
+        if has_directive(directives, "duplicate-cn"):
+            status = "critical"
+            detail = ("duplicate-cn включён — несколько клиентов могут использовать один и тот же сертификат. "
+                      "Это сильно ухудшает аудит и контроль доступа.")
+        else:
+            status = "good"
+            detail = "duplicate-cn не используется — одному сертификату соответствует один клиент."
+        results.append({"param": "duplicate-cn", "status": status, "detail": detail})
+    return results
+
+
+def analyze_openvpn_config_text(text: str) -> str:
+    _, directives = parse_openvpn_config(text)
+    ctype = detect_openvpn_type(directives)
+    results: List[Dict] = []
+    results.extend(analyze_common_network_openvpn(directives, ctype))
+    results.extend(analyze_common_crypto_openvpn(directives))
+    results.extend(analyze_tls_pki_openvpn(directives, ctype))
+    results.extend(analyze_access_control_openvpn(directives, ctype))
+    if ctype == "server":
+        results.extend(analyze_server_specific_openvpn(directives))
+    elif ctype == "client":
+        results.extend(analyze_client_specific_openvpn(directives))
+    else:
+        serv = analyze_server_specific_openvpn(directives)
+        for r in serv:
+            r["param"] += " (предполагаемый серверный параметр)"
+        results.extend(serv)
+        cli = analyze_client_specific_openvpn(directives)
+        for r in cli:
+            r["param"] += " (предполагаемый клиентский параметр)"
+        results.extend(cli)
+    return format_report("OpenVPN", ctype, results)
+
+
+# ==== WireGuard ====
+
+def parse_wireguard_config(text: str) -> Tuple[Dict[str, List[str]], List[Dict[str, List[str]]]]:
+    """
+    Парсинг конфига WireGuard.
+    Возвращает:
+      - словарь параметров секции [Interface] (ключи в нижнем регистре),
+      - список словарей параметров секций [Peer].
+    """
+    sections: List[Dict] = []
+    current_section = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#") or line.startswith(";"):
+            continue
+
+        def strip_comment(l: str) -> str:
+            for sep in ("#", ";"):
+                if sep in l:
+                    l = l.split(sep, 1)[0]
+            return l.strip()
+
+        line = strip_comment(line)
+        if not line:
+            continue
+
+        m = re.match(r"\[(.+?)\]", line)
+        if m:
+            sec_name = m.group(1).strip()
+            current_section = {"name": sec_name, "options": []}
+            sections.append(current_section)
+            continue
+
+        if "=" in line and current_section is not None:
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            current_section["options"].append((key, value))
+
+    interface_opts: Dict[str, List[str]] = {}
+    peers: List[Dict[str, List[str]]] = []
+
+    for sec in sections:
+        name = sec["name"].strip().lower()
+        opt_map: Dict[str, List[str]] = {}
+        for key, value in sec["options"]:
+            k = key.strip().lower()
+            v = value.strip()
+            opt_map.setdefault(k, []).append(v)
+
+        if name == "interface" and not interface_opts:
+            interface_opts = opt_map
+        elif name == "peer":
+            peers.append(opt_map)
+
+    return interface_opts, peers
+
+
+def wg_get_first(opt_map: Dict[str, List[str]], key: str) -> str:
+    key = key.lower()
+    if key in opt_map and opt_map[key]:
+        return opt_map[key][0]
+    return ""
+
+
+def peer_has_full_tunnel(peer: Dict[str, List[str]]) -> bool:
+    vals = peer.get("allowedips", [])
+    for val in vals:
+        for token in re.split(r"[,\s]+", val):
+            t = token.strip()
+            if not t:
+                continue
+            if t in ("0.0.0.0/0", "::/0"):
+                return True
+    return False
+
+
+def any_full_tunnel(peers: List[Dict[str, List[str]]]) -> bool:
+    return any(peer_has_full_tunnel(p) for p in peers)
+
+
+def detect_wg_config_type(interface_opts: Dict[str, List[str]], peers: List[Dict[str, List[str]]]) -> str:
+    has_listen_port = "listenport" in interface_opts
+    peer_has_endpoint = any("endpoint" in p for p in peers)
+    full_tunnel = any_full_tunnel(peers)
+
+    if has_listen_port and not peer_has_endpoint:
+        return "server"
+    if peer_has_endpoint and not has_listen_port:
+        return "client"
+    if full_tunnel and peer_has_endpoint:
+        return "client"
+    if has_listen_port:
+        return "server"
+    return "unknown"
+
+
+def analyze_interface_wireguard(interface_opts: Dict[str, List[str]],
+                                peers: List[Dict[str, List[str]]],
+                                config_type: str) -> List[Dict]:
+    results: List[Dict] = []
+
+    # PrivateKey
+    if "privatekey" in interface_opts:
+        if len(interface_opts["privatekey"]) == 1:
+            status = "good"
+            detail = ("В [Interface] задан PrivateKey. Убедитесь, что файл с конфигурацией защищён правами доступа.")
+        else:
+            status = "bad"
+            detail = "В [Interface] несколько PrivateKey — это ошибка, оставьте только одно значение."
+    else:
+        status = "critical"
+        detail = "В [Interface] отсутствует PrivateKey — интерфейс WireGuard не сможет шифровать трафик."
+    results.append({"param": "[Interface] PrivateKey", "status": status, "detail": detail})
+
+    # Address
+    if "address" in interface_opts:
+        addresses = ", ".join(interface_opts["address"])
+        status = "good"
+        detail = f"В [Interface] задан Address: {addresses}."
+    else:
+        status = "bad"
+        detail = "В [Interface] не задан Address. Рекомендуется явно указать IP-адрес(а) интерфейса."
+    results.append({"param": "[Interface] Address", "status": status, "detail": detail})
+
+    # ListenPort
+    if "listenport" in interface_opts:
+        lp = wg_get_first(interface_opts, "listenport")
+        if config_type == "server":
+            status = "good"
+            detail = f"Сервер WireGuard слушает порт {lp} (ListenPort)."
+        elif config_type == "client":
+            status = "ok"
+            detail = (f"В клиентской конфигурации задан ListenPort = {lp}. "
+                      "Это допустимо, но большинству клиентов он не нужен.")
+        else:
+            status = "ok"
+            detail = f"ListenPort = {lp} задан, но тип конфигурации не определён."
+        results.append({"param": "[Interface] ListenPort", "status": status, "detail": detail})
+    else:
+        if config_type == "server":
+            status = "bad"
+            detail = "Тип конфигурации похож на серверный, но ListenPort не задан."
+            results.append({"param": "[Interface] ListenPort", "status": status, "detail": detail})
+
+    # DNS
+    full_tunnel = any_full_tunnel(peers)
+    if "dns" in interface_opts:
+        dns_vals = ", ".join(interface_opts["dns"])
+        if config_type == "client":
+            if full_tunnel:
+                status = "good"
+                detail = (f"В клиентской конфигурации задан DNS = {dns_vals} при полном туннеле — "
+                          "это помогает избежать DNS-утечек.")
+            else:
+                status = "ok"
+                detail = f"В клиентской конфигурации задан DNS = {dns_vals}."
+        else:
+            status = "ok"
+            detail = f"DNS = {dns_vals} задан в [Interface]."
+        results.append({"param": "[Interface] DNS", "status": status, "detail": detail})
+    else:
+        if config_type == "client" and full_tunnel:
+            status = "bad"
+            detail = "Клиент использует полный туннель (0.0.0.0/0), но DNS не задан — возможны DNS-утечки."
+            results.append({"param": "[Interface] DNS", "status": status, "detail": detail})
+
+    # SaveConfig
+    if "saveconfig" in interface_opts:
+        val = wg_get_first(interface_opts, "saveconfig").lower()
+        status = "ok"
+        detail = (f"SaveConfig = {val}. WireGuard может переписывать конфигурацию. "
+                  "Убедитесь, что понимаете последствия и права на файл ограничены.")
+        results.append({"param": "[Interface] SaveConfig", "status": status, "detail": detail})
+
+    # Лишний PublicKey в [Interface]
+    if "publickey" in interface_opts:
+        status = "bad"
+        detail = "В [Interface] обнаружен PublicKey. Обычно в этой секции хранится только PrivateKey."
+        results.append({"param": "[Interface] PublicKey", "status": status, "detail": detail})
+
+    return results
+
+
+def analyze_peers_wireguard(peers: List[Dict[str, List[str]]], config_type: str) -> List[Dict]:
+    results: List[Dict] = []
+
+    if not peers:
+        status = "bad"
+        detail = "В конфигурации отсутствуют секции [Peer]. Без них нет удалённых участников."
+        results.append({"param": "[Peer] (общий)", "status": status, "detail": detail})
+        return results
+
+    for idx, peer in enumerate(peers, start=1):
+        label_prefix = f"[Peer #{idx}] "
+
+        # PublicKey
+        if "publickey" in peer:
+            pk = wg_get_first(peer, "publickey")
+            short_pk = pk[:16] + "..." if pk else ""
+            status = "good"
+            detail = f"{label_prefix}PublicKey задан ({short_pk})."
+        else:
+            status = "critical"
+            detail = f"{label_prefix}PublicKey отсутствует — соединение с этим пиром невозможно."
+        results.append({"param": label_prefix + "PublicKey", "status": status, "detail": detail})
+
+        # PrivateKey в Peer
+        if "privatekey" in peer:
+            status = "critical"
+            detail = f"{label_prefix}содержит PrivateKey. Приватный ключ не должен находиться в секции [Peer]!"
+            results.append({"param": label_prefix + "PrivateKey", "status": status, "detail": detail})
+
+        # PresharedKey
+        if "presharedkey" in peer:
+            status = "good"
+            detail = f"{label_prefix}PresharedKey задан — включён дополнительный слой шифрования."
+        else:
+            status = "ok"
+            detail = f"{label_prefix}PresharedKey не задан. Для повышенных требований безопасности лучше его использовать."
+        results.append({"param": label_prefix + "PresharedKey", "status": status, "detail": detail})
+
+        # AllowedIPs
+        if "allowedips" not in peer:
+            status = "critical"
+            detail = f"{label_prefix}AllowedIPs не задан — не определён трафик для туннеля."
+            results.append({"param": label_prefix + "AllowedIPs", "status": status, "detail": detail})
+        else:
+            all_vals = peer["allowedips"]
+            tokens: List[str] = []
+            for val in all_vals:
+                for t in re.split(r"[,\s]+", val):
+                    t = t.strip()
+                    if t:
+                        tokens.append(t)
+
+            has_full_ipv4 = any(t == "0.0.0.0/0" for t in tokens)
+            has_full_ipv6 = any(t == "::/0" for t in tokens)
+            has_big_private = any(t in ("10.0.0.0/8", "192.168.0.0/16", "172.16.0.0/12") for t in tokens)
+
+            if config_type == "client":
+                if has_full_ipv4 or has_full_ipv6:
+                    status = "good"
+                    detail = (f"{label_prefix}AllowedIPs включает 0.0.0.0/0 или ::/0 — полный туннель. "
+                              "Убедитесь, что DNS настроен корректно.")
+                else:
+                    status = "ok"
+                    detail = (f"{label_prefix}AllowedIPs = {', '.join(tokens)} — частичный туннель (split-tunnel).")
+            elif config_type == "server":
+                if has_full_ipv4 or has_full_ipv6:
+                    status = "bad"
+                    detail = (f"{label_prefix}AllowedIPs включает 0.0.0.0/0 или ::/0 — пир может объявлять маршрут на весь трафик.")
+                elif has_big_private:
+                    status = "ok"
+                    detail = (f"{label_prefix}AllowedIPs содержит крупные приватные диапазоны: {', '.join(tokens)}.")
+                else:
+                    status = "good"
+                    detail = (f"{label_prefix}AllowedIPs = {', '.join(tokens)} — диапазоны выглядят достаточно узкими.")
+            else:
+                status = "ok"
+                detail = f"{label_prefix}AllowedIPs = {', '.join(tokens)}."
+            results.append({"param": label_prefix + "AllowedIPs", "status": status, "detail": detail})
+
+        # Endpoint
+        if "endpoint" in peer:
+            ep = wg_get_first(peer, "endpoint")
+            if config_type == "client":
+                status = "good"
+                detail = f"{label_prefix}Endpoint = {ep} — адрес сервера WireGuard."
+            elif config_type == "server":
+                status = "ok"
+                detail = f"{label_prefix}Endpoint = {ep}. Для сервера это может быть нетипично."
+            else:
+                status = "ok"
+                detail = f"{label_prefix}Endpoint = {ep}."
+            results.append({"param": label_prefix + "Endpoint", "status": status, "detail": detail})
+        else:
+            if config_type == "client":
+                status = "bad"
+                detail = f"{label_prefix}Endpoint отсутствует — клиент не знает адрес сервера."
+                results.append({"param": label_prefix + "Endpoint", "status": status, "detail": detail})
+
+        # PersistentKeepalive
+        if "persistentkeepalive" in peer:
+            pk = wg_get_first(peer, "persistentkeepalive")
+            status = "good"
+            detail = f"{label_prefix}PersistentKeepalive = {pk} — помогает поддерживать туннель за NAT."
+            results.append({"param": label_prefix + "PersistentKeepalive", "status": status, "detail": detail})
+        else:
+            if config_type == "client" and "endpoint" in peer:
+                status = "ok"
+                detail = (f"{label_prefix}PersistentKeepalive не задан. "
+                          "Для клиентов за NAT имеет смысл указать небольшое значение (15–25 секунд).")
+                results.append({"param": label_prefix + "PersistentKeepalive", "status": status, "detail": detail})
+
+    return results
+
+
+def analyze_wireguard_config_text(text: str) -> str:
+    interface_opts, peers = parse_wireguard_config(text)
+    ctype = detect_wg_config_type(interface_opts, peers)
+    results: List[Dict] = []
+    results.extend(analyze_interface_wireguard(interface_opts, peers, ctype))
+    results.extend(analyze_peers_wireguard(peers, ctype))
+    return format_report("WireGuard", ctype, results)
+
+
+# ==== GUI ====
+
+def run_gui():
+    root = tk.Tk()
+    root.title("VPN Security Analyzer (OpenVPN & WireGuard)")
+    root.geometry("950x750")
+
+    # Заголовок и подзаголовок
+    title_lbl = ttk.Label(
+        root,
+        text="Анализ безопасности конфигураций VPN",
+        font=("Arial", 14, "bold")
+    )
+    title_lbl.pack(fill="x", padx=10, pady=(10, 0))
+
+    subtitle_lbl = ttk.Label(
+        root,
+        text="Поддерживаются OpenVPN и WireGuard",
+        font=("Arial", 9)
+    )
+    subtitle_lbl.pack(fill="x", padx=10, pady=(0, 5))
+
+    # Разделитель
+    sep = ttk.Separator(root, orient="horizontal")
+    sep.pack(fill="x", padx=10, pady=5)
+
+    # верхняя панель: выбор типа VPN
+    top_frame = ttk.Frame(root)
+    top_frame.pack(fill="x", padx=10, pady=10)
+
+    lbl = ttk.Label(top_frame, text="Тип VPN:", anchor="w")
+    lbl.pack(side="left")
+
+    analyzer_var = tk.StringVar(value="openvpn")
+
+    rb_ovpn = ttk.Radiobutton(
+        top_frame, text="OpenVPN", variable=analyzer_var, value="openvpn"
+    )
+    rb_wg = ttk.Radiobutton(
+        top_frame, text="WireGuard", variable=analyzer_var, value="wireguard"
+    )
+    rb_ovpn.pack(side="left", padx=10)
+    rb_wg.pack(side="left", padx=5)
+
+    # панель кнопок
+    btn_frame = ttk.Frame(root)
+    btn_frame.pack(fill="x", padx=10, pady=5)
+
+    path_var = tk.StringVar()
+    type_var = tk.StringVar()
+
+    # поле с отчётом
+    txt = ScrolledText(root, wrap="word", font=("Consolas", 10))
+    txt.pack(fill="both", expand=True, padx=10, pady=5)
+
+    # теги для цветной подсветки
+    txt.tag_config("GOOD", foreground="green")
+    txt.tag_config("OK", foreground="darkorange")
+    txt.tag_config("BAD", foreground="red")
+    txt.tag_config("CRIT", foreground="darkred")
+
+    def set_report(text: str):
+        txt.config(state="normal")
+        txt.delete("1.0", tk.END)
+        txt.insert(tk.END, text)
+        txt.config(state="disabled")
+
+    def highlight_report():
+        # убираем старые подсветки
+        txt.config(state="normal")
+        txt.tag_remove("GOOD", "1.0", tk.END)
+        txt.tag_remove("OK", "1.0", tk.END)
+        txt.tag_remove("BAD", "1.0", tk.END)
+        txt.tag_remove("CRIT", "1.0", tk.END)
+
+        line_index = "1.0"
+        while True:
+            line_end = txt.index(f"{line_index} lineend")
+            line_text = txt.get(line_index, line_end)
+
+            if line_text.startswith("[ХОРОШО]"):
+                txt.tag_add("GOOD", line_index, line_end)
+            elif line_text.startswith("[НОРМАЛЬНО (МОЖНО УЛУЧШИТЬ)]"):
+                txt.tag_add("OK", line_index, line_end)
+            elif line_text.startswith("[ПЛОХО]"):
+                txt.tag_add("BAD", line_index, line_end)
+            elif line_text.startswith("[КРИТИЧНО ПЛОХО]"):
+                txt.tag_add("CRIT", line_index, line_end)
+
+            next_index = txt.index(f"{line_index} +1line")
+            if next_index == line_index:
+                break
+            line_index = next_index
+
+        txt.config(state="disabled")
+
+    # стартовое сообщение
+    set_report("Выберите тип (OpenVPN/WireGuard), затем откройте конфиг для анализа...\n")
+
+    def choose_file():
+        analyzer = analyzer_var.get()
+        if analyzer == "openvpn":
+            filetypes = (("OpenVPN config", "*.conf *.ovpn *.txt"), ("All files", "*.*"))
+            title = "Выбор конфигурационного файла OpenVPN"
+        else:
+            filetypes = (("WireGuard config", "*.conf *.wg *.ini *.txt"), ("All files", "*.*"))
+            title = "Выбор конфигурационного файла WireGuard"
+
+        filename = filedialog.askopenfilename(title=title, filetypes=filetypes)
+        if not filename:
+            return
+
+        path_var.set(filename)
+
+        # читаем файл
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                text = f.read()
+        except UnicodeDecodeError:
+            try:
+                with open(filename, "r", encoding="cp1251", errors="ignore") as f:
+                    text = f.read()
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось прочитать файл:\n{e}")
+                return
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось прочитать файл:\n{e}")
+            return
+
+        # анализируем конфиг
+        try:
+            if analyzer == "openvpn":
+                report = analyze_openvpn_config_text(text)
+            else:
+                report = analyze_wireguard_config_text(text)
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Ошибка при анализе конфигурации:\n{e}")
+            return
+
+        set_report(report)
+        highlight_report()
+
+        # первая строка отчёта (тип конфига)
+        first_line = report.splitlines()[0] if report else ""
+        type_var.set(first_line)
+
+    def save_report():
+        report = txt.get("1.0", tk.END)
+        if not report.strip():
+            messagebox.showwarning("Пустой отчёт", "Нет данных для сохранения.")
+            return
+
+        filename = filedialog.asksaveasfilename(
+            title="Сохранить отчёт",
+            defaultextension=".txt",
+            filetypes=(
+                ("Text files", "*.txt"),
+                ("All files", "*.*"),
+            ),
+        )
+        if not filename:
+            # пользователь нажал Cancel
+            return
+
+        try:
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(report)
+            messagebox.showinfo("Готово", f"Отчёт сохранён в файл:\n{filename}")
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось сохранить файл:\n{e}")
+
+    btn_open = ttk.Button(btn_frame, text="Открыть конфиг...", command=choose_file)
+    btn_open.pack(side="left", padx=(0, 5))
+
+    btn_save = ttk.Button(btn_frame, text="Сохранить отчёт в .txt", command=save_report)
+    btn_save.pack(side="left", padx=5)
+
+    # подписи снизу
+    path_lbl = ttk.Label(root, textvariable=path_var, anchor="w", foreground="gray")
+    path_lbl.pack(fill="x", padx=10, pady=2)
+
+    type_lbl = ttk.Label(root, textvariable=type_var, anchor="w", foreground="blue")
+    type_lbl.pack(fill="x", padx=10, pady=2)
+
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    run_gui()
