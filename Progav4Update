@@ -957,6 +957,7 @@ def run_gui():
     root.title("VPN Security Analyzer (OpenVPN & WireGuard)")
     root.geometry("950x750")
 
+    # --- верхняя панель: выбор типа VPN ---
     top_frame = tk.Frame(root)
     top_frame.pack(fill="x", padx=10, pady=5)
 
@@ -974,15 +975,19 @@ def run_gui():
     rb_ovpn.pack(side="left", padx=10)
     rb_wg.pack(side="left", padx=10)
 
+    # --- панель кнопок ---
     btn_frame = tk.Frame(root)
     btn_frame.pack(fill="x", padx=10, pady=5)
 
     path_var = tk.StringVar()
     type_var = tk.StringVar()
 
+    # --- поле с отчётом ---
     txt = ScrolledText(root, wrap="word", font=("Consolas", 10))
     txt.pack(fill="both", expand=True, padx=10, pady=5)
     txt.insert(tk.END, "Выберите тип (OpenVPN/WireGuard), затем откройте конфиг для анализа...\n")
+
+    # --- функции внутри GUI ---
 
     def choose_file():
         analyzer = analyzer_var.get()
@@ -999,6 +1004,7 @@ def run_gui():
 
         path_var.set(filename)
 
+        # читаем файл
         try:
             with open(filename, "r", encoding="utf-8") as f:
                 text = f.read()
@@ -1009,6 +1015,7 @@ def run_gui():
             messagebox.showerror("Ошибка", f"Не удалось прочитать файл:\n{e}")
             return
 
+        # анализируем конфиг
         try:
             if analyzer == "openvpn":
                 report = analyze_openvpn_config_text(text)
@@ -1018,9 +1025,11 @@ def run_gui():
             messagebox.showerror("Ошибка", f"Ошибка при анализе конфигурации:\n{e}")
             return
 
+        # выводим отчёт
         txt.delete("1.0", tk.END)
         txt.insert(tk.END, report)
 
+        # первая строка отчёта (тип конфига)
         first_line = report.splitlines()[0] if report else ""
         type_var.set(first_line)
 
@@ -1039,6 +1048,7 @@ def run_gui():
             ),
         )
         if not filename:
+            # пользователь нажал Cancel
             return
 
         try:
@@ -1048,11 +1058,15 @@ def run_gui():
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось сохранить файл:\n{e}")
 
+    # --- кнопки (важно: после определения функций choose_file и save_report) ---
+
     btn_open = tk.Button(btn_frame, text="Открыть конфиг...", command=choose_file)
     btn_open.pack(side="left")
 
     btn_save = tk.Button(btn_frame, text="Сохранить отчёт в .txt", command=save_report)
     btn_save.pack(side="left", padx=5)
+
+    # --- подписи снизу ---
 
     path_lbl = tk.Label(root, textvariable=path_var, anchor="w", fg="gray")
     path_lbl.pack(fill="x", padx=10, pady=2)
@@ -1061,7 +1075,5 @@ def run_gui():
     type_lbl.pack(fill="x", padx=10, pady=2)
 
     root.mainloop()
-
-
 if __name__ == "__main__":
     run_gui()
