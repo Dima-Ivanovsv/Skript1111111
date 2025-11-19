@@ -1,0 +1,1699 @@
+import re
+import ipaddress
+
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from tkinter.scrolledtext import ScrolledText
+from tkinter import ttk
+
+# уровни "оценок" параметров
+STATUS_LEVELS = ["good", "ok", "bad", "critical"]
+
+
+# ------------------------ общие функции ------------------------
+
+
+def norm_status(status_text):
+    if not status_text:
+        return "ok"
+    status_text = str(status_text).strip().lower()
+    if status_text not in STATUS_LEVELS:
+        return "ok"
+    return status_text
+
+
+def worse_status(a_status, b_status):
+    a_status = norm_status(a_status)
+    b_status = norm_status(b_status)
+    return a_status if STATUS_LEVELS.index(a_status) > STATUS_LEVELS.index(b_status) else b_status
+
+
+def make_summary(check_list):
+    summary = {"good": 0, "ok": 0, "bad": 0, "critical": 0}
+    worst = "good"
+
+    for item in check_list:
+        status = norm_status(item.get("status"))
+        if status in summary:
+            summary[status] += 1
+        worst = worse_status(worst, status)
+
+    if worst == "good":
+        text = (
+            "Конфигурация оценивается как безопасная по анализируемым параметрам. "
+            "Критически небезопасных или явно слабых настроек не обнаружено."
+        )
+    elif worst == "ok":
+        text = (
+            "Конфигурация в целом безопасна, однако имеются параметры, которые можно "
+            "дополнительно усилить для повышения уровня защищённости."
+        )
+    elif worst == "bad":
+        text = (
+            "В конфигурации присутствуют небезопасные параметры. "
+            "Рекомендуется их скорректировать согласно рекомендациям отчёта."
+        )
+    else:
+        text = (
+            "Обнаружены критически небезопасные параметры. "
+            "Использование такой конфигурации без исправления настроек не рекомендуется."
+        )
+
+    return {"summary": summary, "worst": worst, "overall": text}
+
+
+def make_report(vpn_name, conf_type, check_list):
+    header_lines = []
+
+    if conf_type == "server":
+        header_lines.append(f"Тип конфигурации: Серверная конфигурация {vpn_name}")
+    elif conf_type == "client":
+        header_lines.append(f"Тип конфигурации: КЛиентская конфигурация {vpn_name}")
+    else:
+        header_lines.append(f"Тип конфигурации: Не определен ({vpn_name})")
+
+    header_lines.append("")
+
+    summary_info = make_summary(check_list)
+    summary = summary_info["summary"]
+    overall_text = summary_info["overall"]
+
+    header_lines.append("Итоговый отчет:")
+    header_lines.append(overall_text)
+    header_lines.append(
+        f"Параметров в состоянии Хорошо: {summary['good']}, "
+        f"Удовлетворительн: {summary['ok']}, "
+        f"Плохо: {summary['bad']}, "
+        f"Критично для безопасности: {summary['critical']}."
+    )
+    header_lines.append("")
+    header_lines.append("Детальный анализ:")
+    header_lines.append("")
+
+    status_to_rus = {
+        "good": "Хорошо",
+        "ok": "Удовлетворительно",
+        "bad": "Плохо",
+        "critical": "Критично для безопасности",
+    }
+
+    body_lines = []
+    for item in check_list:
+        status = norm_status(item.get("status"))
+        rus = status_to_rus.get(status, "НОРМАЛЬНО")
+        param_name = item.get("param", "Неизвестный параметр")
+        detail = item.get("detail", "")
+        body_lines.append(f"[{rus}] {param_name}")
+        if detail:
+            body_lines.append(f"    {detail}")
+        body_lines.append("")
+
+    return "\n".join(header_lines + body_lines)
+
+
+# ======================= OpenVPN блок =======================
+
+
+def parse_openvpn_config(text):
+    """Парсим конфиг OpenVPN -> список строк и словарь параметров."""
+    line_list = []      # [(имя_директивы, [арг1, арг2, ...]), ...]
+    ovpn_dict = {}      # { "proto": [ ["udp"], ... ], ... }
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+
+        # отрезаем комментарии в конце строк, если они не в кавычках
+        for com in ("#", ";"):
+            if com in line:
+                before, after = line.split(com, 1)
+                if before.count('"') % 2 == 0 and before.count("'") % 2 == 0:
+                    line = before.strip()
+        if not line:
+            continue
+
+        parts = line.split()
+        if not parts:
+            continue
+
+        key = parts[0].lower()
+        args = parts[1:]
+        line_list.append((key, args))
+        ovpn_dict.setdefault(key, []).append(args)
+
+    return line_list, ovpn_dict
+
+
+def ovpn_has(ovpn_dict, name):
+    return name.lower() in ovpn_dict
+
+
+def ovpn_first_arg(ovpn_dict, name):
+    key = name.lower()
+    if key not in ovpn_dict or not ovpn_dict[key]:
+        return None
+    args = ovpn_dict[key][0]
+    return args[0] if args else None
+
+
+def ovpn_all_pushes(ovpn_dict):
+    pushes = []
+    if "push" in ovpn_dict:
+        for args in ovpn_dict["push"]:
+            if args:
+                pushes.append(" ".join(args))
+    return pushes
+
+
+def detect_openvpn_type(ovpn_dict):
+    # явные признаки
+    if ovpn_has(ovpn_dict, "server") or ovpn_has(ovpn_dict, "server-bridge"):
+        return "server"
+    if ovpn_has(ovpn_dict, "client"):
+        return "client"
+
+    # косвенные
+    server_marks = {
+        "server",
+        "server-bridge",
+        "ifconfig-pool-persist",
+        "push",
+        "duplicate-cn",
+        "verify-client-cert",
+        "crl-verify",
+        "client-to-client",
+    }
+    client_marks = {"remote", "auth-user-pass", "nobind", "remote-cert-tls"}
+
+    server_score = sum(1 for key in server_marks if ovpn_has(ovpn_dict, key))
+    client_score = sum(1 for key in client_marks if ovpn_has(ovpn_dict, key))
+
+    if server_score > client_score:
+        return "server"
+    if client_score > server_score:
+        return "client"
+    return "unknown"
+
+
+def check_openvpn_network(ovpn_dict, conf_type):
+    check_list = []
+
+    # proto
+    proto_val = ovpn_first_arg(ovpn_dict, "proto")
+    if proto_val is None:
+        status = "bad"
+        detail = (
+            "Параметр proto не задан. Рекомендуется явно указать proto udp для уменьшения задержек "
+            "и повышения устойчивости соединения."
+        )
+    else:
+        proto_l = proto_val.lower()
+        if proto_l.startswith("udp"):
+            status = "good"
+            detail = f"proto {proto_val} — используется UDP, это рекомендуемый вариант для OpenVPN."
+        elif proto_l.startswith("tcp"):
+            status = "bad"
+            detail = (
+                f"proto {proto_val} — используется TCP. Это допустимо, но хуже по производительности "
+                "и устойчивости (TCP поверх TCP). Лучше использовать UDP, если нет жёстких ограничений."
+            )
+        else:
+            status = "ok"
+            detail = f"proto {proto_val} — нетипичное значение. Проверьте корректность параметра."
+    check_list.append({"param": "proto", "status": status, "detail": detail})
+
+    # dev
+    dev_val = ovpn_first_arg(ovpn_dict, "dev")
+    if dev_val is None:
+        status = "critical"
+        detail = (
+            "Параметр dev не задан. Рекомендуется явно указать dev tun (IP-туннель) либо другой "
+            "осознанно выбранный тип интерфейса."
+        )
+    else:
+        dev_l = dev_val.lower()
+        if dev_l == "tun":
+            status = "good"
+            detail = "dev tun — IP-туннель, рекомендуемый вариант для большинства сценариев."
+        elif dev_l == "tap":
+            status = "bad"
+            detail = (
+                "dev tap — туннель L2. Это увеличивает поверхность атаки за счёт широковещательных "
+                "и служебных кадров. Используйте только при явной необходимости."
+            )
+        else:
+            status = "ok"
+            detail = f"dev {dev_val} — нетипичный тип интерфейса. Убедитесь, что он действительно нужен."
+    check_list.append({"param": "dev", "status": status, "detail": detail})
+
+    # порт: для сервера — port, для клиента — порт из remote
+    if conf_type == "server":
+        port_val = ovpn_first_arg(ovpn_dict, "port")
+        if port_val is None:
+            status = "bad"
+            detail = (
+                "Параметр port для сервера не задан. Рекомендуется явно указать порт (обычно 1194/udp "
+                "или другой согласованный)."
+            )
+        else:
+            try:
+                port_num = int(port_val)
+            except ValueError:
+                port_num = None
+
+            if port_num is None:
+                status = "bad"
+                detail = f"port={port_val} не удалось интерпретировать как число. Проверьте конфиг."
+            else:
+                if port_num == 1194:
+                    status = "good"
+                    detail = "port 1194 — стандартный порт OpenVPN."
+                elif port_num in (80, 443):
+                    status = "ok"
+                    detail = (
+                        f"port {port_num} — HTTP/HTTPS порт. Удобно для обхода блокировок, "
+                        "но требует аккуратной настройки."
+                    )
+                elif port_num in (22, 53, 3389):
+                    status = "critical"
+                    detail = (
+                        f"port {port_num} — порт обычно используется другим протоколом (SSH/DNS/RDP). "
+                        "Такое наложение нежелательно."
+                    )
+                else:
+                    status = "ok"
+                    detail = (
+                        f"port {port_num} — нестандартный порт. Это допустимо, но нужно контролировать, "
+                        "чтобы его не использовали другие сервисы."
+                    )
+        check_list.append({"param": "port", "status": status, "detail": detail})
+
+    elif conf_type == "client":
+        remote_port_val = None
+        if "remote" in ovpn_dict and ovpn_dict["remote"]:
+            args = ovpn_dict["remote"][0]
+            if len(args) >= 2:
+                remote_port_val = args[1]
+
+        if remote_port_val:
+            try:
+                remote_port_num = int(remote_port_val)
+            except ValueError:
+                remote_port_num = None
+
+            if remote_port_num is None:
+                status = "bad"
+                detail = (
+                    f"Во второй позиции remote указан порт '{remote_port_val}', "
+                    "который не удалось интерпретировать как число."
+                )
+            else:
+                if remote_port_num == 1194:
+                    status = "good"
+                    detail = "Клиент подключается к стандартному порту 1194."
+                elif remote_port_num in (80, 443):
+                    status = "ok"
+                    detail = (
+                        f"Клиент подключается к порту {remote_port_num} (HTTP/HTTPS). "
+                        "Это популярный способ обходить фильтрацию."
+                    )
+                elif remote_port_num in (22, 53, 3389):
+                    status = "critical"
+                    detail = (
+                        f"Клиент подключается к порту {remote_port_num} (SSH/DNS/RDP). "
+                        "Использовать эти порты под VPN не рекомендуется."
+                    )
+                else:
+                    status = "ok"
+                    detail = f"Клиент подключается к нестандартному порту {remote_port_num}."
+            check_list.append({
+                "param": "remote (port)",
+                "status": status,
+                "detail": detail,
+            })
+
+    # topology
+    topo_val = ovpn_first_arg(ovpn_dict, "topology")
+    if topo_val is None:
+        status = "ok"
+        detail = (
+            "Параметр topology не задан — используется значение по умолчанию. "
+            "Рекомендуется явно указать topology subnet для многопользовательских конфигураций."
+        )
+    else:
+        topo_l = topo_val.lower()
+        if topo_l == "subnet":
+            status = "good"
+            detail = "topology subnet — современный и рекомендуемый режим."
+        elif topo_l == "p2p":
+            status = "bad"
+            detail = "topology p2p — режим точка–точка, не подходит для многопользовательских VPN."
+        elif topo_l == "net30":
+            status = "critical"
+            detail = "topology net30 — устаревший режим, лучше перейти на subnet."
+        else:
+            status = "ok"
+            detail = f"topology {topo_val} — нестандартное значение, проверьте необходимость."
+    check_list.append({"param": "topology", "status": status, "detail": detail})
+
+    return check_list
+
+
+def check_openvpn_crypto(ovpn_dict):
+    check_list = []
+
+    # data-ciphers
+    if ovpn_has(ovpn_dict, "data-ciphers"):
+        raw = " ".join(ovpn_dict["data-ciphers"][0])
+        cipher_list = [c.strip().upper() for c in re.split(r"[,:]", raw) if c.strip()]
+        modern = {"AES-256-GCM", "AES-192-GCM", "AES-128-GCM", "CHACHA20-POLY1305"}
+        old_ok = {"AES-256-CBC", "AES-192-CBC", "AES-128-CBC"}
+        weak = {"BF-CBC", "DES-CBC", "DES-EDE3-CBC", "RC2-CBC", "RC4", "NONE"}
+
+        has_modern = any(c in modern for c in cipher_list)
+        has_old = any(c in old_ok for c in cipher_list)
+        has_weak = any(c in weak for c in cipher_list)
+
+        if has_weak:
+            status = "critical"
+            detail = (
+                f"data-ciphers = {', '.join(cipher_list)} — в списке есть слабые шифры "
+                "(BF-CBC/DES/RC4/NONE). Их использование недопустимо."
+            )
+        elif has_modern:
+            status = "good"
+            detail = (
+                f"data-ciphers = {', '.join(cipher_list)} — используются современные шифры "
+                "(AES-GCM/CHACHA20-POLY1305)."
+            )
+        elif has_old:
+            status = "bad"
+            detail = (
+                f"data-ciphers = {', '.join(cipher_list)} — используются устаревающие режимы (AES-CBC). "
+                "Лучше перейти на AES-GCM или CHACHA20-POLY1305."
+            )
+        else:
+            status = "ok"
+            detail = (
+                f"data-ciphers = {', '.join(cipher_list)} — нестандартный набор. "
+                "Проверьте, что здесь только стойкие алгоритмы."
+            )
+    else:
+        status = "bad"
+        detail = (
+            "data-ciphers не задан. Рекомендуется явно указать список современных шифров "
+            "(AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305)."
+        )
+    check_list.append({"param": "data-ciphers", "status": status, "detail": detail})
+
+    # data-ciphers-fallback
+    if ovpn_has(ovpn_dict, "data-ciphers-fallback"):
+        fb = " ".join(ovpn_dict["data-ciphers-fallback"][0])
+        status = "good"
+        detail = f"data-ciphers-fallback = {fb} — есть резервный шифр для старых клиентов."
+    else:
+        status = "ok"
+        detail = (
+            "data-ciphers-fallback не задан. Для совместимости со старыми клиентами можно указать безопасный fallback."
+        )
+    check_list.append({"param": "data-ciphers-fallback", "status": status, "detail": detail})
+
+    # cipher (legacy)
+    if ovpn_has(ovpn_dict, "cipher"):
+        legacy = " ".join(ovpn_dict["cipher"][0])
+        status = "critical"
+        detail = (
+            f"Обнаружен устаревший параметр cipher ({legacy}). "
+            "Вместо него нужно использовать только data-ciphers."
+        )
+        check_list.append({"param": "cipher", "status": status, "detail": detail})
+
+    # auth
+    auth_val = ovpn_first_arg(ovpn_dict, "auth")
+    if auth_val:
+        a = auth_val.upper()
+        if a in ("SHA256", "SHA384", "SHA512"):
+            status = "good"
+            detail = f"auth {auth_val} — современный алгоритм HMAC."
+        elif a in ("MD5", "SHA1"):
+            status = "bad"
+            detail = (
+                f"auth {auth_val} — устаревший HMAC (MD5/SHA1). "
+                "Лучше использовать SHA256 или выше."
+            )
+        else:
+            status = "ok"
+            detail = f"auth {auth_val} — нетипичный алгоритм, проверьте его стойкость."
+    else:
+        status = "bad"
+        detail = "auth не задан. Лучше явно указать auth SHA256."
+    check_list.append({"param": "auth", "status": status, "detail": detail})
+
+    # replay-window
+    if ovpn_has(ovpn_dict, "replay-window"):
+        status = "good"
+        detail = "replay-window задан — защита от повторов настроена явно."
+    else:
+        status = "ok"
+        detail = (
+            "replay-window не задан — используется дефолт. "
+            "Можно задать явно, чтобы лучше контролировать защиту от повторов."
+        )
+    check_list.append({"param": "replay-window", "status": status, "detail": detail})
+
+    # mute-replay-warnings
+    if ovpn_has(ovpn_dict, "mute-replay-warnings"):
+        status = "bad"
+        detail = (
+            "mute-replay-warnings включён — предупреждения о повторных пакетах подавляются. "
+            "Это мешает расследованию атак."
+        )
+        check_list.append({"param": "mute-replay-warnings", "status": status, "detail": detail})
+
+    return check_list
+
+
+def check_openvpn_server_extra(ovpn_dict):
+    check_list = []
+
+    # ifconfig-pool-persist
+    if ovpn_has(ovpn_dict, "ifconfig-pool-persist"):
+        status = "good"
+        detail = (
+            "ifconfig-pool-persist используется — IP клиентов фиксируются, "
+            "это упрощает аудит."
+        )
+    else:
+        status = "bad"
+        detail = (
+            "ifconfig-pool-persist не используется — IP клиентов могут меняться от сессии к сессии, "
+            "аудит усложняется."
+        )
+    check_list.append({"param": "ifconfig-pool-persist", "status": status, "detail": detail})
+
+    # redirect-gateway / DNS
+    push_list = ovpn_all_pushes(ovpn_dict)
+    has_redirect = any("redirect-gateway" in p.lower() for p in push_list)
+    has_dns_push = any(p.lower().startswith("dhcp-option dns") for p in push_list)
+
+    if has_redirect:
+        if has_dns_push:
+            status = "good"
+            detail = (
+                "Сервер пушит redirect-gateway и dhcp-option DNS — весь трафик и DNS идут через VPN."
+            )
+        else:
+            status = "bad"
+            detail = (
+                "Сервер пушит redirect-gateway (полный туннель), но не dhcp-option DNS. "
+                "Могут быть DNS-утечки вне VPN."
+            )
+    else:
+        status = "ok"
+        detail = (
+            "Сервер не пушит redirect-gateway — используется split-tunnel. "
+            "Часть трафика идёт вне VPN."
+        )
+    check_list.append({"param": "redirect-gateway/DNS", "status": status, "detail": detail})
+
+    # client-to-client
+    if ovpn_has(ovpn_dict, "client-to-client"):
+        status = "bad"
+        detail = (
+            "client-to-client включён — клиенты могут общаться друг с другом в VPN, "
+            "это увеличивает поверхность атаки."
+        )
+    else:
+        status = "good"
+        detail = "client-to-client не используется — клиенты изолированы."
+    check_list.append({"param": "client-to-client", "status": status, "detail": detail})
+
+    # user / group
+    has_user = ovpn_has(ovpn_dict, "user")
+    has_group = ovpn_has(ovpn_dict, "group")
+    if has_user or has_group:
+        user_val = ovpn_first_arg(ovpn_dict, "user") or ""
+        group_val = ovpn_first_arg(ovpn_dict, "group") or ""
+        if user_val.lower() == "nobody" and group_val.lower() in ("nogroup", "nobody"):
+            status = "good"
+            detail = "user nobody / group nogroup — демон запущен от непривилегированного пользователя."
+        else:
+            status = "ok"
+            detail = (
+                f"user {user_val or '-'} / group {group_val or '-'} — убедитесь, что это "
+                "непривилегированный пользователь."
+            )
+    else:
+        status = "bad"
+        detail = (
+            "user/group не заданы — OpenVPN, скорее всего, работает от root. "
+            "Лучше запускать от непривилегированного пользователя."
+        )
+    check_list.append({"param": "user/group", "status": status, "detail": detail})
+
+    # chroot
+    if ovpn_has(ovpn_dict, "chroot"):
+        status = "good"
+        detail = "chroot используется — процесс OpenVPN дополнительно изолирован."
+    else:
+        status = "ok"
+        detail = "chroot не используется. При высоких требованиях можно его включить."
+    check_list.append({"param": "chroot", "status": status, "detail": detail})
+
+    return check_list
+
+
+def check_openvpn_tls_pki(ovpn_dict, conf_type):
+    check_list = []
+
+    has_ca = ovpn_has(ovpn_dict, "ca")
+    has_cert = ovpn_has(ovpn_dict, "cert")
+    has_key = ovpn_has(ovpn_dict, "key")
+    has_secret = ovpn_has(ovpn_dict, "secret")
+
+    # PKI vs static key
+    if has_secret and not (has_ca or has_cert or has_key):
+        status = "critical"
+        detail = (
+            "Используется только static key (secret) без PKI (ca/cert/key). "
+            "Этот режим менее безопасен и гибок."
+        )
+    elif has_ca and has_cert and has_key:
+        status = "good"
+        detail = "ca, cert и key заданы — используется полноценная PKI."
+    elif has_ca or has_cert or has_key:
+        status = "bad"
+        detail = (
+            "Набор ca/cert/key неполный. Нужно задать все три параметра для корректной работы PKI."
+        )
+    else:
+        status = "bad"
+        detail = (
+            "Не обнаружены ни ca/cert/key, ни secret. Схема аутентификации/шифрования не настроена."
+        )
+    check_list.append({"param": "PKI/ключи", "status": status, "detail": detail})
+
+    # dh / ecdh-curve
+    has_dh = ovpn_has(ovpn_dict, "dh")
+    has_ecdh = ovpn_has(ovpn_dict, "ecdh-curve")
+    if has_ecdh:
+        curve_text = " ".join(ovpn_dict["ecdh-curve"][0]) if ovpn_dict["ecdh-curve"][0] else ""
+        status = "good"
+        detail = f"ecdh-curve {curve_text or ''} — используется современный ECDH."
+    elif has_dh:
+        dh_text = " ".join(ovpn_dict["dh"][0]) if ovpn_dict["dh"][0] else ""
+        status = "ok"
+        detail = (
+            f"dh {dh_text or ''} — классический Диффи–Хеллман. "
+            "Можно рассмотреть переход на ecdh-curve."
+        )
+    else:
+        status = "bad"
+        detail = "dh/ecdh-curve не заданы — обмен ключами явно не настроен."
+    check_list.append({"param": "dh/ecdh-curve", "status": status, "detail": detail})
+
+    # tls-version-min
+    if ovpn_has(ovpn_dict, "tls-version-min"):
+        tls_val = ovpn_first_arg(ovpn_dict, "tls-version-min") or ""
+        m = re.search(r"(\d+\.\d+)", tls_val)
+        tls_num = None
+        if m:
+            try:
+                tls_num = float(m.group(1))
+            except ValueError:
+                tls_num = None
+
+        if tls_num is None:
+            status = "bad"
+            detail = (
+                f"tls-version-min {tls_val} — версию TLS не удалось понять. "
+                "Лучше явно указать не ниже 1.2."
+            )
+        elif tls_num < 1.2:
+            status = "critical"
+            detail = (
+                f"tls-version-min {tls_val} — допускаются TLS < 1.2. "
+                "Нужно поднять минимальную версию."
+            )
+        else:
+            status = "good"
+            detail = f"tls-version-min {tls_val} — версии TLS ниже 1.2 запрещены."
+    else:
+        status = "critical"
+        detail = (
+            "tls-version-min не задан. Теоретически могут быть разрешены устаревшие версии TLS. "
+            "Лучше явно указать 1.2 или 1.3."
+        )
+    check_list.append({"param": "tls-version-min", "status": status, "detail": detail})
+
+    # tls-cipher / tls-ciphersuites
+    if ovpn_has(ovpn_dict, "tls-cipher"):
+        status = "ok"
+        detail = (
+            "tls-cipher задан — используется свой список TLS-шифросьютов. "
+            "Проверьте, что там нет старых наборов."
+        )
+        check_list.append({"param": "tls-cipher", "status": status, "detail": detail})
+
+    if ovpn_has(ovpn_dict, "tls-ciphersuites"):
+        status = "ok"
+        detail = (
+            "tls-ciphersuites задан — есть явный список шифросьютов TLS 1.3. "
+            "Проверьте его состав."
+        )
+        check_list.append({"param": "tls-ciphersuites", "status": status, "detail": detail})
+
+    # tls-auth / tls-crypt / tls-crypt-v2
+    has_tls_auth = ovpn_has(ovpn_dict, "tls-auth")
+    has_tls_crypt = ovpn_has(ovpn_dict, "tls-crypt")
+    has_tls_crypt_v2 = ovpn_has(ovpn_dict, "tls-crypt-v2")
+
+    if has_tls_crypt_v2:
+        status = "good"
+        detail = "tls-crypt-v2 — управляющий канал шифруется и аутентифицируется."
+    elif has_tls_crypt:
+        status = "good"
+        detail = "tls-crypt — управляющий канал шифруется и аутентифицируется."
+    elif has_tls_auth:
+        status = "ok"
+        detail = (
+            "tls-auth — есть HMAC на управляющем канале, но канал не шифруется целиком. "
+            "Лучше перейти на tls-crypt."
+        )
+    else:
+        status = "critical"
+        detail = (
+            "Не используются tls-auth/tls-crypt/tls-crypt-v2. "
+            "Управляющий канал не защищён дополнительным ключом."
+        )
+    check_list.append({"param": "tls-auth/tls-crypt", "status": status, "detail": detail})
+
+    # reneg-sec
+    if ovpn_has(ovpn_dict, "reneg-sec"):
+        reneg_val = ovpn_first_arg(ovpn_dict, "reneg-sec")
+        try:
+            reneg_num = int(reneg_val)
+        except (TypeError, ValueError):
+            reneg_num = None
+
+        if reneg_num is None:
+            status = "bad"
+            detail = (
+                f"reneg-sec {reneg_val} — не удалось понять значение. "
+                "Лучше указать понятный интервал (например, 3600)."
+            )
+        elif 3600 <= reneg_num <= 86400:
+            status = "good"
+            detail = f"reneg-sec = {reneg_num} — нормальный интервал пересогласования ключей."
+        elif reneg_num > 86400:
+            status = "bad"
+            detail = (
+                f"reneg-sec = {reneg_num} — ключи пересогласовываются слишком редко. "
+                "Интервал лучше уменьшить."
+            )
+        else:
+            status = "ok"
+            detail = (
+                f"reneg-sec = {reneg_num} — ключи пересогласовываются очень часто. "
+                "Это безопасно, но может нагружать систему."
+            )
+        check_list.append({"param": "reneg-sec", "status": status, "detail": detail})
+    else:
+        status = "critical"
+        detail = (
+            "reneg-sec не задан — пересогласование ключей не ограничено явно. "
+            "Лучше задать его, например, 3600 секунд."
+        )
+        check_list.append({"param": "reneg-sec", "status": status, "detail": detail})
+
+    # verify-client-cert / crl-verify / remote-cert-tls
+    if conf_type == "server":
+        if ovpn_has(ovpn_dict, "verify-client-cert"):
+            status = "good"
+            detail = "verify-client-cert — сервер строго проверяет клиентские сертификаты."
+        else:
+            status = "bad"
+            detail = "verify-client-cert не задан. Лучше включить строгую проверку клиентов."
+        check_list.append({"param": "verify-client-cert", "status": status, "detail": detail})
+
+        if ovpn_has(ovpn_dict, "crl-verify"):
+            status = "good"
+            detail = "crl-verify — сервер проверяет список отозванных сертификатов."
+        else:
+            status = "bad"
+            detail = "crl-verify не задан — отозванные сертификаты не блокируются автоматически."
+        check_list.append({"param": "crl-verify", "status": status, "detail": detail})
+
+        if ovpn_has(ovpn_dict, "remote-cert-tls"):
+            role = (ovpn_first_arg(ovpn_dict, "remote-cert-tls") or "").lower()
+            if role == "client":
+                status = "good"
+                detail = "remote-cert-tls client — сервер проверяет, что к нему именно клиенты."
+            else:
+                status = "ok"
+                detail = (
+                    f"remote-cert-tls {role or ''} — параметр задан, но значение нетипичное. "
+                    "Для сервера обычно используют client."
+                )
+        else:
+            status = "bad"
+            detail = (
+                "remote-cert-tls не задан на сервере. "
+                "Рекомендуется добавить remote-cert-tls client."
+            )
+        check_list.append({"param": "remote-cert-tls (server)", "status": status, "detail": detail})
+
+    elif conf_type == "client":
+        if ovpn_has(ovpn_dict, "remote-cert-tls"):
+            role = (ovpn_first_arg(ovpn_dict, "remote-cert-tls") or "").lower()
+            if role == "server":
+                status = "good"
+                detail = "remote-cert-tls server — клиент проверяет, что сертификат принадлежит серверу."
+            else:
+                status = "ok"
+                detail = (
+                    f"remote-cert-tls {role or ''} — параметр задан, но значение нетипичное. "
+                    "Обычно для клиента указывают server."
+                )
+        else:
+            status = "critical"
+            detail = (
+                "remote-cert-tls не задан на клиенте. "
+                "Клиент может не проверять тип сертификата сервера."
+            )
+        check_list.append({"param": "remote-cert-tls (client)", "status": status, "detail": detail})
+
+    return check_list
+
+
+def check_openvpn_client_extra(ovpn_dict):
+    check_list = []
+
+    # auth-user-pass
+    if ovpn_has(ovpn_dict, "auth-user-pass"):
+        status = "good"
+        detail = "auth-user-pass — используется парольная аутентификация помимо сертификатов."
+    else:
+        status = "ok"
+        detail = "auth-user-pass не используется. Это допустимо при аутентификации только по сертификатам."
+    check_list.append({"param": "auth-user-pass", "status": status, "detail": detail})
+
+    # auth-nocache
+    if ovpn_has(ovpn_dict, "auth-user-pass"):
+        if ovpn_has(ovpn_dict, "auth-nocache"):
+            status = "good"
+            detail = (
+                "auth-nocache — пароль не кэшируется в памяти клиента после входа. "
+                "Это снижает риск компрометации."
+            )
+        else:
+            status = "bad"
+            detail = (
+                "auth-user-pass используется без auth-nocache — пароль может оставаться в памяти. "
+                "Лучше добавить auth-nocache."
+            )
+        check_list.append({"param": "auth-nocache", "status": status, "detail": detail})
+    elif ovpn_has(ovpn_dict, "auth-nocache"):
+        status = "ok"
+        detail = (
+            "auth-nocache указан без auth-user-pass. "
+            "Проверьте, действительно ли используется парольная аутентификация."
+        )
+        check_list.append({"param": "auth-nocache", "status": status, "detail": detail})
+
+    # nobind
+    if ovpn_has(ovpn_dict, "nobind"):
+        status = "good"
+        detail = "nobind — клиент не привязывается к фиксированному локальному порту, удобно за NAT."
+    else:
+        status = "ok"
+        detail = (
+            "nobind не задан — клиент может использовать фиксированный локальный порт. "
+            "Для NAT обычно лучше nobind."
+        )
+    check_list.append({"param": "nobind", "status": status, "detail": detail})
+
+    # verify-x509-name
+    if ovpn_has(ovpn_dict, "verify-x509-name"):
+        status = "good"
+        detail = "verify-x509-name — клиент дополнительно проверяет имя в сертификате сервера."
+    else:
+        status = "ok"
+        detail = "verify-x509-name не используется. Лучше включить для усиления проверки сервера."
+    check_list.append({"param": "verify-x509-name", "status": status, "detail": detail})
+
+    return check_list
+
+
+def check_openvpn_access(ovpn_dict, conf_type):
+    check_list = []
+    if conf_type == "server":
+        has_dup = ovpn_has(ovpn_dict, "duplicate-cn")
+        has_pool = ovpn_has(ovpn_dict, "ifconfig-pool-persist")
+
+        if has_dup:
+            if not has_pool:
+                status = "critical"
+                detail = (
+                    "duplicate-cn включён и при этом нет ifconfig-pool-persist — "
+                    "несколько клиентов могут использовать один сертификат и получать плавающие IP. "
+                    "Аудит и контроль доступа сильно ухудшаются."
+                )
+            else:
+                status = "bad"
+                detail = (
+                    "duplicate-cn включён — нескольким клиентам разрешено использовать один сертификат. "
+                    "ifconfig-pool-persist фиксирует IP, но всё равно сложно понять, кто именно подключён."
+                )
+        else:
+            status = "good"
+            detail = (
+                "duplicate-cn не используется — один сертификат соответствует одному клиенту, "
+                "что упрощает аудит."
+            )
+        check_list.append({"param": "duplicate-cn", "status": status, "detail": detail})
+
+    return check_list
+
+
+def check_openvpn_sessions(ovpn_dict, conf_type):
+    check_list = []
+
+    # keepalive / ping / ping-restart
+    has_keepalive = ovpn_has(ovpn_dict, "keepalive")
+    has_ping = ovpn_has(ovpn_dict, "ping")
+    has_ping_restart = ovpn_has(ovpn_dict, "ping-restart")
+
+    if has_keepalive:
+        keep_args = ovpn_dict["keepalive"][0]
+        if len(keep_args) >= 2:
+            try:
+                interval = int(keep_args[0])
+                timeout = int(keep_args[1])
+                status = "good"
+                detail = (
+                    f"keepalive {interval} {timeout} — контролируется доступность соединения "
+                    "и выполняется автопереподключение при обрыве."
+                )
+            except ValueError:
+                status = "ok"
+                detail = (
+                    "keepalive указан, но аргументы не удалось интерпретировать. "
+                    "Проверьте формат keepalive <interval> <timeout>."
+                )
+        else:
+            status = "ok"
+            detail = (
+                "keepalive указан с нетипичным количеством аргументов. "
+                "Рекомендуется формат keepalive <interval> <timeout>."
+            )
+        check_list.append({
+            "param": "keepalive/ping/ping-restart",
+            "status": status,
+            "detail": detail,
+        })
+    else:
+        if has_ping or has_ping_restart:
+            if has_ping and has_ping_restart:
+                status = "ok"
+                detail = (
+                    "Используются ping и ping-restart без keepalive. "
+                    "Это работает, но для наглядности проще использовать keepalive."
+                )
+            elif has_ping and not has_ping_restart:
+                status = "bad"
+                detail = (
+                    "Используется только ping без ping-restart. "
+                    "При потере связи автопереподключения может не быть."
+                )
+            else:
+                status = "ok"
+                detail = (
+                    "Используется только ping-restart без явного ping. "
+                    "Нестандартная схема, проверьте конфигурацию."
+                )
+            check_list.append({
+                "param": "keepalive/ping/ping-restart",
+                "status": status,
+                "detail": detail,
+            })
+        else:
+            if conf_type == "client":
+                status = "ok"
+                detail = (
+                    "keepalive/ping/ping-restart не заданы. "
+                    "Клиент может позже обнаруживать обрыв, но для некоторых случаев это нормально."
+                )
+            else:
+                status = "bad"
+                detail = (
+                    "На сервере не настроены keepalive/ping/ping-restart. "
+                    "Обрывы могут долго не обнаруживаться, это мешает сопровождению."
+                )
+            check_list.append({
+                "param": "keepalive/ping/ping-restart",
+                "status": status,
+                "detail": detail,
+            })
+
+    # persist-key / persist-tun
+    has_persist_key = ovpn_has(ovpn_dict, "persist-key")
+    has_persist_tun = ovpn_has(ovpn_dict, "persist-tun")
+
+    if has_persist_key and has_persist_tun:
+        status = "good"
+        detail = (
+            "persist-key и persist-tun заданы — при перезапуске OpenVPN ключи и туннель сохраняются, "
+            "что уменьшает побочные эффекты."
+        )
+    elif has_persist_key or has_persist_tun:
+        status = "ok"
+        detail = (
+            "Задан только persist-key или только persist-tun. "
+            "Рекомендуется использовать оба параметра вместе."
+        )
+    else:
+        status = "ok"
+        detail = (
+            "persist-key/persist-tun не используются. Это допустимо, "
+            "но можно включить для более аккуратного поведения при перезапуске."
+        )
+    check_list.append({"param": "persist-key/persist-tun", "status": status, "detail": detail})
+
+    return check_list
+
+
+def check_openvpn_logging(ovpn_dict, conf_type):
+    check_list = []
+
+    has_log = ovpn_has(ovpn_dict, "log") or ovpn_has(ovpn_dict, "log-append")
+    has_status = ovpn_has(ovpn_dict, "status")
+
+    # log/log-append/status
+    if has_log or has_status:
+        status = "good"
+        detail = (
+            "log/log-append/status настроены — логи и статус пишутся в файл, "
+            "это помогает при аудите и отладке."
+        )
+    else:
+        if conf_type == "server":
+            status = "bad"
+            detail = (
+                "На сервере не настроено логирование в файл (log/log-append/status). "
+                "Диагностика и анализ инцидентов будут сильно осложнены."
+            )
+        else:
+            status = "ok"
+            detail = (
+                "Логирование в файл (log/log-append/status) не настроено. "
+                "Для клиента это допустимо, но при отладке будет сложнее."
+            )
+    check_list.append({
+        "param": "log/log-append/status",
+        "status": status,
+        "detail": detail,
+    })
+
+    # verb
+    if ovpn_has(ovpn_dict, "verb"):
+        verb_val = ovpn_first_arg(ovpn_dict, "verb")
+        try:
+            verb_num = int(verb_val)
+        except (TypeError, ValueError):
+            verb_num = None
+
+        if verb_num is None:
+            status = "bad"
+            detail = (
+                "verb задан, но значение не удалось интерпретировать. "
+                "Проверьте конфигурацию."
+            )
+        elif 3 <= verb_num <= 4:
+            status = "good"
+            detail = (
+                f"verb = {verb_num} — нормальный уровень логирования: информации достаточно, "
+                "но без сильного шума."
+            )
+        elif 0 <= verb_num <= 2:
+            status = "ok"
+            detail = (
+                f"verb = {verb_num} — низкий уровень логов. "
+                "Для расследования инцидентов может быть мало информации."
+            )
+        elif 5 <= verb_num <= 6:
+            status = "ok"
+            detail = (
+                f"verb = {verb_num} — повышенный уровень детализации. Удобно для отладки, "
+                "но в бою может быть многословно."
+            )
+        else:
+            status = "bad"
+            detail = (
+                f"verb = {verb_num} — слишком высокий уровень логирования. "
+                "Логи могут быть огромными и содержать лишние детали."
+            )
+        check_list.append({"param": "verb", "status": status, "detail": detail})
+    else:
+        status = "ok"
+        detail = (
+            "verb не задан — используется значение по умолчанию. "
+            "При необходимости более детального аудита можно явно указать уровень."
+        )
+        check_list.append({"param": "verb", "status": status, "detail": detail})
+
+    return check_list
+
+
+def analyze_openvpn_config_text(text):
+    _, ovpn_dict = parse_openvpn_config(text)
+    conf_type = detect_openvpn_type(ovpn_dict)
+
+    check_list = []
+    check_list.extend(check_openvpn_network(ovpn_dict, conf_type))
+    check_list.extend(check_openvpn_crypto(ovpn_dict))
+    check_list.extend(check_openvpn_tls_pki(ovpn_dict, conf_type))
+    check_list.extend(check_openvpn_access(ovpn_dict, conf_type))
+    check_list.extend(check_openvpn_sessions(ovpn_dict, conf_type))
+    check_list.extend(check_openvpn_logging(ovpn_dict, conf_type))
+
+    if conf_type == "server":
+        check_list.extend(check_openvpn_server_extra(ovpn_dict))
+    elif conf_type == "client":
+        check_list.extend(check_openvpn_client_extra(ovpn_dict))
+    else:
+        # если тип непонятен — всё равно покажем и серверные, и клиентские проверки
+        tmp_server = check_openvpn_server_extra(ovpn_dict)
+        for item in tmp_server:
+            item["param"] += " (предполагаемый серверный параметр)"
+        check_list.extend(tmp_server)
+
+        tmp_client = check_openvpn_client_extra(ovpn_dict)
+        for item in tmp_client:
+            item["param"] += " (предполагаемый клиентский параметр)"
+        check_list.extend(tmp_client)
+
+    return make_report("OpenVPN", conf_type, check_list)
+
+
+# ======================= WireGuard блок =======================
+
+
+def parse_wireguard_config(text):
+    """Парсим конфиг WireGuard -> словарь [Interface] и список [Peer]."""
+    section_list = []
+    current_section = None
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+
+        header_match = re.match(r"\[(.+?)\]", line)
+        if header_match:
+            sec_name = header_match.group(1).strip()
+            current_section = {"name": sec_name, "options": []}
+            section_list.append(current_section)
+            continue
+
+        if "=" in line and current_section is not None:
+            key, value = line.split("=", 1)
+            key = key.strip().lower()
+            value = value.strip()
+            current_section["options"].append((key, value))
+
+    wg_iface = {}
+    wg_peers = []
+
+    for sec in section_list:
+        name = sec["name"].strip().lower()
+        if name == "interface" and not wg_iface:
+            for key, value in sec["options"]:
+                wg_iface.setdefault(key, []).append(value)
+        elif name == "peer":
+            peer_dict = {}
+            for key, value in sec["options"]:
+                peer_dict.setdefault(key, []).append(value)
+            wg_peers.append(peer_dict)
+
+    return wg_iface, wg_peers
+
+
+def wg_get_first(wg_dict, key):
+    key = key.lower()
+    if key not in wg_dict or not wg_dict[key]:
+        return None
+    return wg_dict[key][0]
+
+
+def wg_peer_has_full_tunnel(peer_dict):
+    vals = peer_dict.get("allowedips", [])
+    for val in vals:
+        for token in re.split(r"[,\s]+", val):
+            t = token.strip()
+            if not t:
+                continue
+            if t in ("0.0.0.0/0", "::/0"):
+                return True
+    return False
+
+
+def wg_any_full_tunnel(peer_list):
+    return any(wg_peer_has_full_tunnel(p) for p in peer_list)
+
+
+def detect_wireguard_type(wg_iface, wg_peers):
+    has_listen = "listenport" in wg_iface
+    peer_has_endpoint = any("endpoint" in p for p in wg_peers)
+    full_tunnel = wg_any_full_tunnel(wg_peers)
+
+    if has_listen and not peer_has_endpoint:
+        return "server"
+    if peer_has_endpoint and not has_listen:
+        return "client"
+    if full_tunnel and peer_has_endpoint:
+        return "client"
+    if has_listen:
+        return "server"
+    return "unknown"
+
+
+def check_wireguard_interface(wg_iface, wg_peers, conf_type):
+    check_list = []
+
+    # PrivateKey
+    if "privatekey" in wg_iface:
+        if len(wg_iface["privatekey"]) == 1:
+            status = "good"
+            detail = (
+                "PrivateKey задан в [Interface]. Убедитесь, что файл конфигурации защищён правами доступа."
+            )
+        else:
+            status = "bad"
+            detail = (
+                "В [Interface] указано несколько PrivateKey. Это выглядит как ошибка конфигурации."
+            )
+    else:
+        status = "critical"
+        detail = (
+            "В [Interface] нет PrivateKey. Без приватного ключа интерфейс WireGuard не сможет работать."
+        )
+    check_list.append({"param": "[Interface] PrivateKey", "status": status, "detail": detail})
+
+    # Address
+    if "address" in wg_iface:
+        status = "good"
+        detail = (
+            "Address задан — интерфейс WireGuard имеет IP-адрес(а). Проверьте корректность сетей."
+        )
+    else:
+        status = "bad"
+        detail = (
+            "Address в [Interface] не указан. Интерфейс может остаться без IP-адреса, "
+            "что сломает маршрутизацию."
+        )
+    check_list.append({"param": "[Interface] Address", "status": status, "detail": detail})
+
+    # ListenPort
+    if "listenport" in wg_iface:
+        lp = wg_get_first(wg_iface, "listenport")
+        if conf_type == "server":
+            status = "good"
+            detail = f"ListenPort = {lp} — сервер WireGuard слушает входящие подключения на этом порту."
+        elif conf_type == "client":
+            status = "ok"
+            detail = (
+                f"ListenPort = {lp} указан в клиентском конфиге. Это допустимо, но обычно клиенту "
+                "фиксированный порт не обязателен."
+            )
+        else:
+            status = "ok"
+            detail = (
+                f"ListenPort = {lp} задан. Убедитесь, что роль узла (сервер/клиент) определена правильно."
+            )
+        check_list.append({"param": "[Interface] ListenPort", "status": status, "detail": detail})
+    else:
+        if conf_type == "server":
+            status = "bad"
+            detail = (
+                "В серверной конфигурации не указан ListenPort. "
+                "Нужно явно указать порт, на котором сервер принимает соединения."
+            )
+            check_list.append({"param": "[Interface] ListenPort", "status": status, "detail": detail})
+
+    # DNS
+    full_tunnel = wg_any_full_tunnel(wg_peers)
+    if "dns" in wg_iface:
+        dns_val = ", ".join(wg_iface["dns"])
+        if conf_type == "client":
+            if full_tunnel:
+                status = "good"
+                detail = (
+                    f"DNS = {dns_val} — при полном туннеле DNS-запросы будут идти через VPN."
+                )
+            else:
+                status = "ok"
+                detail = (
+                    f"DNS = {dns_val} — DNS-серверы заданы. При split-tunnel проверьте, что это соответствует политике."
+                )
+        else:
+            status = "ok"
+            detail = (
+                f"DNS = {dns_val} — DNS указан в [Interface]. Обычно этого достаточно на клиенте."
+            )
+        check_list.append({"param": "[Interface] DNS", "status": status, "detail": detail})
+    else:
+        if conf_type == "client" and full_tunnel:
+            status = "bad"
+            detail = (
+                "Клиентский конфиг использует полный туннель (0.0.0.0/0 или ::/0), "
+                "но DNS в [Interface] не задан. Возможны DNS-утечки."
+            )
+            check_list.append({"param": "[Interface] DNS", "status": status, "detail": detail})
+
+    # SaveConfig
+    if "saveconfig" in wg_iface:
+        status = "ok"
+        detail = (
+            "SaveConfig включён — WireGuard может переписывать конфиг-файл. "
+            "Убедитесь, что права на файл ограничены."
+        )
+        check_list.append({"param": "[Interface] SaveConfig", "status": status, "detail": detail})
+
+    # PublicKey в [Interface] — подозрительно
+    if "publickey" in wg_iface:
+        status = "bad"
+        detail = (
+            "В [Interface] обнаружен PublicKey. Обычно здесь нужен только PrivateKey, "
+            "а PublicKey указывают в [Peer]. Проверьте конфиг."
+        )
+        check_list.append({"param": "[Interface] PublicKey", "status": status, "detail": detail})
+
+    return check_list
+
+
+def check_wireguard_peers(wg_peers, conf_type):
+    check_list = []
+
+    if not wg_peers:
+        status = "bad"
+        detail = (
+            "В конфиге нет ни одного [Peer]. Туннель ни с кем не соединяется."
+        )
+        check_list.append({"param": "[Peer] (общий)", "status": status, "detail": detail})
+        return check_list
+
+    for peer_index, peer_dict in enumerate(wg_peers, start=1):
+        title = f"[Peer #{peer_index}] "
+
+        # PublicKey
+        if "publickey" in peer_dict:
+            status = "good"
+            detail = f"{title}PublicKey задан — пир однозначно идентифицируется."
+        else:
+            status = "critical"
+            detail = f"{title}PublicKey не указан — пир нельзя идентифицировать."
+        check_list.append({"param": f"{title}PublicKey", "status": status, "detail": detail})
+
+        # PrivateKey в Peer (ошибка)
+        if "privatekey" in peer_dict:
+            status = "critical"
+            detail = (
+                f"{title}обнаружен PrivateKey. Приватный ключ должен быть только в [Interface] "
+                "локальной стороны. В [Peer] его быть не должно."
+            )
+            check_list.append({"param": f"{title}PrivateKey", "status": status, "detail": detail})
+
+        # PresharedKey
+        if "presharedkey" in peer_dict:
+            status = "good"
+            detail = f"{title}PresharedKey задан — используется дополнительный симметричный ключ."
+        else:
+            status = "ok"
+            detail = (
+                f"{title}PresharedKey не используется. Для повышенных требований безопасности "
+                "рекомендуется его включить."
+            )
+        check_list.append({"param": f"{title}PresharedKey", "status": status, "detail": detail})
+
+        # AllowedIPs
+        if "allowedips" not in peer_dict:
+            status = "critical"
+            detail = f"{title}AllowedIPs не задан. Не определён трафик для этого пира."
+            check_list.append({"param": f"{title}AllowedIPs", "status": status, "detail": detail})
+        else:
+            all_vals = peer_dict["allowedips"]
+            token_list = []
+            for val in all_vals:
+                for t in re.split(r"[,\s]+", val):
+                    t = t.strip()
+                    if t:
+                        token_list.append(t)
+
+            has_full_v4 = any(t == "0.0.0.0/0" for t in token_list)
+            has_full_v6 = any(t == "::/0" for t in token_list)
+            big_sets = {"10.0.0.0/8", "192.168.0.0/16", "172.16.0.0/12"}
+            has_big_priv = any(t in big_sets for t in token_list)
+
+            if conf_type == "client":
+                if has_full_v4 or has_full_v6:
+                    status = "good"
+                    detail = (
+                        f"{title}AllowedIPs включает 0.0.0.0/0 или ::/0 — полный туннель. "
+                        "Убедитесь, что DNS настроен через VPN."
+                    )
+                else:
+                    status = "ok"
+                    detail = (
+                        f"{title}AllowedIPs задаёт частичный туннель. "
+                        "Часть трафика идёт вне VPN."
+                    )
+            elif conf_type == "server":
+                if has_full_v4 или has_full_v6:
+                    status = "bad"
+                    detail = (
+                        f"{title}AllowedIPs содержит 0.0.0.0/0 или ::/0 — клиент получает маршрут на весь трафик. "
+                        "Обычно для сервера это нежелательно."
+                    )
+                elif has_big_priv:
+                    status = "ok"
+                    detail = (
+                        f"{title}AllowedIPs включает крупные приватные диапазоны. "
+                        "Проверьте, что это соответствует внутренней сети."
+                    )
+                else:
+                    status = "good"
+                    detail = (
+                        f"{title}AllowedIPs задаёт относительно узкие сети, что упрощает контроль доступа."
+                    )
+            else:
+                status = "ok"
+                detail = (
+                    f"{title}AllowedIPs задан. При неизвестной роли узла "
+                    "сложно оценить корректность, проверьте вручную."
+                )
+            check_list.append({"param": f"{title}AllowedIPs", "status": status, "detail": detail})
+
+        # Endpoint
+        if "endpoint" in peer_dict:
+            ep = wg_get_first(peer_dict, "endpoint")
+            if conf_type == "client":
+                status = "good"
+                detail = f"{title}Endpoint = {ep} — клиент знает адрес сервера."
+            elif conf_type == "server":
+                status = "ok"
+                detail = (
+                    f"{title}Endpoint = {ep} — для сервера обычно Endpoint указывают на клиенте, "
+                    "но бывают и особые схемы."
+                )
+            else:
+                status = "ok"
+                detail = (
+                    f"{title}Endpoint = {ep}. При неизвестной роли узла проверьте корректность настройки."
+                )
+            check_list.append({"param": f"{title}Endpoint", "status": status, "detail": detail})
+        else:
+            if conf_type == "client":
+                status = "bad"
+                detail = (
+                    f"{title}Endpoint не указан в клиентском конфиге. Клиент не знает, к кому подключаться."
+                )
+                check_list.append({"param": f"{title}Endpoint", "status": status, "detail": detail})
+
+        # PersistentKeepalive
+        if "persistentkeepalive" in peer_dict:
+            keep_val = wg_get_first(peer_dict, "persistentkeepalive")
+            status = "good"
+            detail = (
+                f"{title}PersistentKeepalive = {keep_val} — помогает поддерживать соединение за NAT."
+            )
+            check_list.append({"param": f"{title}PersistentKeepalive", "status": status, "detail": detail})
+        else:
+            if conf_type == "client" and "endpoint" in peer_dict:
+                status = "ok"
+                detail = (
+                    f"{title}PersistentKeepalive не задан. Для клиентов за NAT полезно установить "
+                    "значение около 15–25 секунд."
+                )
+                check_list.append({"param": f"{title}PersistentKeepalive", "status": status, "detail": detail})
+
+    return check_list
+
+
+def check_wireguard_relations(wg_iface, wg_peers):
+    """Проверка пересечений AllowedIPs между пирами и пересечений Address/AllowedIPs."""
+    check_list = []
+
+    # собираем IP интерфейса
+    iface_ip_list = []
+    for val in wg_iface.get("address", []):
+        for token in re.split(r"[,\s]+", val):
+            t = token.strip()
+            if not t:
+                continue
+            try:
+                ip_if = ipaddress.ip_interface(t)
+            except ValueError:
+                continue
+            iface_ip_list.append(ip_if.ip)
+
+    # собираем сети AllowedIPs для каждого пира
+    wg_peers_nets = []
+    for peer_dict in wg_peers:
+        net_list = []
+        for val in peer_dict.get("allowedips", []):
+            for token in re.split(r"[,\s]+", val):
+                t = token.strip()
+                if not t:
+                    continue
+                try:
+                    net_obj = ipaddress.ip_network(t, strict=False)
+                except ValueError:
+                    continue
+                net_list.append(net_obj)
+        wg_peers_nets.append(net_list)
+
+    # пересечения между пирами
+    for i in range(len(wg_peers_nets)):
+        for j in range(i + 1, len(wg_peers_nets)):
+            overlap = None
+            for net1 in wg_peers_nets[i]:
+                for net2 in wg_peers_nets[j]:
+                    if net1.overlaps(net2):
+                        overlap = (net1, net2)
+                        break
+                if overlap:
+                    break
+            if overlap:
+                net1, net2 = overlap
+                check_list.append({
+                    "param": f"[Peers #{i+1} и #{j+1}] пересечение AllowedIPs",
+                    "status": "bad",
+                    "detail": (
+                        f"Диапазоны AllowedIPs пиров #{i+1} и #{j+1} пересекаются ({net1} и {net2}). "
+                        "Это может вызвать конфликты маршрутизации и усложнить аудит."
+                    ),
+                })
+
+    # пересечение Address и AllowedIPs
+    if iface_ip_list and wg_peers_nets:
+        for idx, net_list in enumerate(wg_peers_nets, start=1):
+            found = False
+            for ip_obj in iface_ip_list:
+                for net_obj in net_list:
+                    if ip_obj.version != net_obj.version:
+                        continue
+                    if ip_obj in net_obj and net_obj.prefixlen in (32, 128):
+                        check_list.append({
+                            "param": f"[Peer #{idx}] пересечение Address и AllowedIPs",
+                            "status": "bad",
+                            "detail": (
+                                f"Локальный адрес {ip_obj} попадает в AllowedIPs пира #{idx} ({net_obj}). "
+                                "Это похоже на ошибку конфигурации (маршрут на самого себя)."
+                            ),
+                        })
+                        found = True
+                        break
+                if found:
+                    break
+
+    return check_list
+
+
+def analyze_wireguard_config_text(text):
+    wg_iface, wg_peers = parse_wireguard_config(text)
+    conf_type = detect_wireguard_type(wg_iface, wg_peers)
+
+    check_list = []
+    check_list.extend(check_wireguard_interface(wg_iface, wg_peers, conf_type))
+    check_list.extend(check_wireguard_peers(wg_peers, conf_type))
+    check_list.extend(check_wireguard_relations(wg_iface, wg_peers))
+
+    return make_report("WireGuard", conf_type, check_list)
+
+
+# ======================= GUI =======================
+
+
+def run_gui():
+    main_win = tk.Tk()
+    main_win.title("VPN Security Analyzer (OpenVPN & WireGuard)")
+    main_win.geometry("950x750")
+
+    # заголовок
+    title_lbl = ttk.Label(main_win, text="Анализ безопасности конфигураций VPN", font=("Segoe UI", 14, "bold"))
+    title_lbl.pack(pady=(10, 0))
+
+    subtitle_lbl = ttk.Label(main_win, text="Поддерживаются OpenVPN и WireGuard", font=("Segoe UI", 10))
+    subtitle_lbl.pack(pady=(0, 10))
+
+    sep = ttk.Separator(main_win, orient="horizontal")
+    sep.pack(fill="x", padx=10, pady=(0, 10))
+
+    # выбор протокола
+    top_frame = ttk.Frame(main_win)
+    top_frame.pack(fill="x", padx=10)
+
+    vpn_type_var = tk.StringVar(value="openvpn")
+
+    rb_ovpn = ttk.Radiobutton(top_frame, text="OpenVPN", variable=vpn_type_var, value="openvpn")
+    rb_wg = ttk.Radiobutton(top_frame, text="WireGuard", variable=vpn_type_var, value="wireguard")
+    rb_ovpn.pack(side="left")
+    rb_wg.pack(side="left", padx=(10, 0))
+
+    # кнопки
+    btn_frame = ttk.Frame(main_win)
+    btn_frame.pack(fill="x", padx=10, pady=(10, 5))
+
+    file_path_var = tk.StringVar()
+    conf_type_var = tk.StringVar()
+
+    # окно отчёта
+    report_box = ScrolledText(main_win, wrap="word", font=("Consolas", 10))
+    report_box.pack(fill="both", expand=True, padx=10, pady=(0, 5))
+
+    # раскраска статусов
+    report_box.tag_config("GOOD", foreground="green")
+    report_box.tag_config("OK", foreground="darkorange")
+    report_box.tag_config("BAD", foreground="red")
+    report_box.tag_config("CRIT", foreground="darkred")
+
+    def show_report(text):
+        report_box.config(state="normal")
+        report_box.delete("1.0", tk.END)
+        report_box.insert(tk.END, text)
+        report_box.config(state="disabled")
+
+    def color_report():
+        report_box.config(state="normal")
+        for tag in ("GOOD", "OK", "BAD", "CRIT"):
+            report_box.tag_remove(tag, "1.0", tk.END)
+
+        line_num = 1
+        while True:
+            line_start = f"{line_num}.0"
+            line_end = f"{line_num}.end"
+            line_text = report_box.get(line_start, line_end)
+            if not line_text and report_box.get(line_start) == "":
+                break
+
+            stripped = line_text.strip()
+            if stripped.startswith("[Хорошо]"):
+                report_box.tag_add("GOOD", line_start, line_end)
+            elif stripped.startswith("[Удовлетворительно]"):
+                report_box.tag_add("OK", line_start, line_end)
+            elif stripped.startswith("[Плохо]"):
+                report_box.tag_add("BAD", line_start, line_end)
+            elif stripped.startswith("[Критично для безопасности]"):
+                report_box.tag_add("CRIT", line_start, line_end)
+
+            line_num += 1
+
+        report_box.config(state="disabled")
+
+    def open_config():
+        vpn_type = vpn_type_var.get()
+        if vpn_type == "openvpn":
+            file_types = [("OpenVPN configs", "*.conf *.ovpn"), ("All files", "*.*")]
+            title = "Выбор конфигурации OpenVPN"
+        else:
+            file_types = [("WireGuard configs", "*.conf *.wg *.ini"), ("All files", "*.*")]
+            title = "Выбор конфигурации WireGuard"
+
+        cfg_path = filedialog.askopenfilename(title=title, filetypes=file_types)
+        if not cfg_path:
+            return
+
+        file_path_var.set(cfg_path)
+
+        try:
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg_text = f.read()
+            except UnicodeDecodeError:
+                with open(cfg_path, "r", encoding="cp1251", errors="ignore") as f:
+                    cfg_text = f.read()
+        except Exception as e:
+            messagebox.showerror("Ошибка чтения файла", f"Не удалось прочитать файл:\n{e}")
+            return
+
+        try:
+            if vpn_type == "openvpn":
+                report_text = analyze_openvpn_config_text(cfg_text)
+            else:
+                report_text = analyze_wireguard_config_text(cfg_text)
+        except Exception as e:
+            messagebox.showerror("Ошибка анализа", f"Во время анализа произошла ошибка:\n{e}")
+            return
+
+        show_report(report_text)
+        color_report()
+
+        first_line = report_text.splitlines()[0] if report_text else ""
+        conf_type_var.set(first_line)
+
+    def save_report():
+        content = report_box.get("1.0", tk.END).strip()
+        if not content:
+            messagebox.showwarning("Сохранение отчёта", "Отчёт пустой — сначала запусти анализ конфигурации.")
+            return
+
+        save_path = filedialog.asksaveasfilename(
+            title="Сохранить отчёт",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not save_path:
+            return
+
+        try:
+            with open(save_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception as e:
+            messagebox.showerror("Ошибка сохранения", f"Не удалось сохранить отчёт:\n{e}")
+            return
+
+        messagebox.showinfo("Сохранение отчёта", "Отчёт успешно сохранён.")
+
+    btn_open = ttk.Button(btn_frame, text="Открыть конфиг...", command=open_config)
+    btn_open.pack(side="left")
+
+    btn_save = ttk.Button(btn_frame, text="Сохранить отчёт в .txt", command=save_report)
+    btn_save.pack(side="left", padx=(10, 0))
+
+    # строка состояния
+    status_frame = ttk.Frame(main_win)
+    status_frame.pack(fill="x", padx=10, pady=(0, 10))
+
+    path_lbl = ttk.Label(status_frame, textvariable=file_path_var, foreground="gray")
+    path_lbl.pack(side="left")
+
+    type_lbl = ttk.Label(status_frame, textvariable=conf_type_var, foreground="blue")
+    type_lbl.pack(side="right")
+
+    main_win.mainloop()
+
+
+if __name__ == "__main__":
+    run_gui()
