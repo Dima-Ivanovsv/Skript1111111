@@ -1024,37 +1024,35 @@ def run_gui():
         first_line = report.splitlines()[0] if report else ""
         type_var.set(first_line)
 
-        def save_report():
-            report = txt.get("1.0", tk.END)
-            if not report.strip():
-                messagebox.showwarning("Пустой отчёт", "Нет данных для сохранения.")
-                return
+    def save_report():
+        report = txt.get("1.0", tk.END)
+        if not report.strip():
+            messagebox.showwarning("Пустой отчёт", "Нет данных для сохранения.")
+            return
 
-            filename = filedialog.asksaveasfilename(
-                title="Сохранить отчёт",
-                defaultextension=".txt",
-                filetypes=(
-                    ("Text files", "*.txt"),
-                    ("All files", "*.*"),
-                ),
-          )
+        filename = filedialog.asksaveasfilename(
+            title="Сохранить отчёт",
+            defaultextension=".txt",
+            filetypes=(
+                ("Text files", "*.txt"),
+                ("All files", "*.*"),
+            ),
+        )
         if not filename:
-            # пользователь нажал Cancel
-              return
+            return
 
         try:
-              with open(filename, "w", encoding="utf-8") as f:
-                  f.write(report)
-              messagebox.showinfo("Готово", f"Отчёт сохранён в файл:\n{filename}")
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(report)
+            messagebox.showinfo("Готово", f"Отчёт сохранён в файл:\n{filename}")
         except Exception as e:
-              messagebox.showerror("Ошибка", f"Не удалось сохранить файл:\n{e}")
+            messagebox.showerror("Ошибка", f"Не удалось сохранить файл:\n{e}")
 
     btn_open = tk.Button(btn_frame, text="Открыть конфиг...", command=choose_file)
     btn_open.pack(side="left")
 
     btn_save = tk.Button(btn_frame, text="Сохранить отчёт в .txt", command=save_report)
     btn_save.pack(side="left", padx=5)
-
 
     path_lbl = tk.Label(root, textvariable=path_var, anchor="w", fg="gray")
     path_lbl.pack(fill="x", padx=10, pady=2)
