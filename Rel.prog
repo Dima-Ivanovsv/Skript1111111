@@ -57,7 +57,7 @@ def format_report(vpn_name: str, config_type: str, results: List[Dict]) -> str:
     header.append("ИТОГОВАЯ РЕЗОЛЮЦИЯ:")
     header.append(summ["overall"])
     header.append(f"- Параметров в состоянии 'Хорошо': {summ['summary']['good']}")
-    header.append(f"- Параметров в состоянии 'Удовлетворительн,но можно улучшить': {summ['summary']['ok']}")
+    header.append(f"- Параметров в состоянии 'Удовлетворительно,но можно улучшить': {summ['summary']['ok']}")
     header.append(f"- Параметров в состоянии 'Плохо': {summ['summary']['bad']}")
     header.append(f"- Параметров в состоянии 'Критично': {summ['summary']['critical']}")
     header.append("")
