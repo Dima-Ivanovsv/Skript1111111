@@ -1370,7 +1370,7 @@ def check_wireguard_peers(wg_peers, conf_type):
                         "Часть трафика идёт вне VPN."
                     )
             elif conf_type == "server":
-                if has_full_v4 или has_full_v6:
+                if has_full_v4 and has_full_v6:
                     status = "bad"
                     detail = (
                         f"{title}AllowedIPs содержит 0.0.0.0/0 или ::/0 — клиент получает маршрут на весь трафик. "
