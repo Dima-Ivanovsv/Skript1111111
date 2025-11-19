@@ -1025,29 +1025,29 @@ def run_gui():
         type_var.set(first_line)
 
         def save_report():
-        report = txt.get("1.0", tk.END)
-        if not report.strip():
-            messagebox.showwarning("Пустой отчёт", "Нет данных для сохранения.")
-            return
+            report = txt.get("1.0", tk.END)
+            if not report.strip():
+                messagebox.showwarning("Пустой отчёт", "Нет данных для сохранения.")
+                return
 
-        filename = filedialog.asksaveasfilename(
-            title="Сохранить отчёт",
-            defaultextension=".txt",
-            filetypes=(
-                ("Text files", "*.txt"),
-                ("All files", "*.*"),
-            ),
-        )
-        if not filename:
+            filename = filedialog.asksaveasfilename(
+                title="Сохранить отчёт",
+                defaultextension=".txt",
+                filetypes=(
+                    ("Text files", "*.txt"),
+                    ("All files", "*.*"),
+                ),
+          )
+          if not filename:
             # пользователь нажал Cancel
-            return
+              return
 
-        try:
-            with open(filename, "w", encoding="utf-8") as f:
-                f.write(report)
-            messagebox.showinfo("Готово", f"Отчёт сохранён в файл:\n{filename}")
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось сохранить файл:\n{e}")
+          try:
+              with open(filename, "w", encoding="utf-8") as f:
+                  f.write(report)
+              messagebox.showinfo("Готово", f"Отчёт сохранён в файл:\n{filename}")
+          except Exception as e:
+              messagebox.showerror("Ошибка", f"Не удалось сохранить файл:\n{e}")
 
     btn_open = tk.Button(btn_frame, text="Открыть конфиг...", command=choose_file)
     btn_open.pack(side="left")
