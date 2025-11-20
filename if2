@@ -2,7 +2,15 @@ import re
 import ipaddress
 import html as html_mod
 
-from flask import Flask, request, flash, render_template_string
+from flask import (
+    Flask,
+    request,
+    flash,
+    render_template_string,
+    redirect,
+    url_for,
+    make_response,
+)
 
 # =========================
 #  Общие утилиты статусов
@@ -261,7 +269,6 @@ def check_openvpn_network(ovpn_dict, conf_type):
                 detail = f"port {port_val} — некорректное значение, порт не является числом."
         checks.append({"param": "port", "status": status, "detail": detail})
     else:
-        # клиентский remote-порт просто помечаем как ok/bad
         remotes = ovpn_dict.get("remote", [])
         if not remotes:
             status = "bad"
@@ -1424,6 +1431,16 @@ INDEX_HTML = """
                                 <div class="report-box">
                                     {{ report_html|safe }}
                                 </div>
+                                {% if report_raw %}
+                                <div class="d-flex justify-content-end mt-3">
+                                    <form method="post" action="{{ url_for('download_report') }}">
+                                        <textarea name="report_text" hidden>{{ report_raw|e }}</textarea>
+                                        <button type="submit" class="btn btn-outline-light btn-sm">
+                                            Скачать отчёт (.txt)
+                                        </button>
+                                    </form>
+                                </div>
+                                {% endif %}
                             {% else %}
                                 <div class="report-box text-muted d-flex align-items-center justify-content-center" style="min-height: 160px;">
                                     <div class="text-center">
@@ -1621,6 +1638,19 @@ def index():
         vpn_type=vpn_type,
         config_text=cfg_text,
     )
+
+
+@app.route("/download_report", methods=["POST"])
+def download_report():
+    report_text = request.form.get("report_text", "")
+    if not report_text.strip():
+        flash("Отчёт отсутствует или пуст — сначала выполните анализ конфигурации.", "warning")
+        return redirect(url_for("index"))
+
+    resp = make_response(report_text)
+    resp.headers["Content-Type"] = "text/plain; charset=utf-8"
+    resp.headers["Content-Disposition"] = "attachment; filename=vpn_security_report.txt"
+    return resp
 
 
 if __name__ == "__main__":
