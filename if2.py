@@ -13,9 +13,6 @@ from flask import (
 )
 
 
-#Статусы
-
-
 STATUS_LEVELS = ["good", "ok", "bad", "critical"]
 
 
@@ -105,9 +102,6 @@ def make_report(vpn_name, conf_type, check_list):
     return "\n".join(header_lines + body_lines)
 
 
-
-#парсер ovpn
-
 def parse_openvpn_config(text):
     line_list = []
     ovpn_dict = {}
@@ -191,10 +185,6 @@ def detect_openvpn_type(ovpn_dict):
     if client_score > server_score:
         return "client"
     return "unknown"
-
-
-
-#проверка ovpn
 
 
 def check_openvpn_network(ovpn_dict, conf_type):
