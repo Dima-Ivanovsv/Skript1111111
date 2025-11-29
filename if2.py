@@ -57,11 +57,11 @@ def make_report(vpn_name, conf_type, check_list):
     header_lines = []
 
     if conf_type == "server":
-        header_lines.append(f"Тип конфигурации: СЕРВЕР {vpn_name}")
+        header_lines.append(f"Тип конфигурации: Серверная конфигурация {vpn_name}")
     elif conf_type == "client":
-        header_lines.append(f"Тип конфигурации: КЛИЕНТ {vpn_name}")
+        header_lines.append(f"Тип конфигурации: Клиентская конфигурация {vpn_name}")
     else:
-        header_lines.append(f"Тип конфигурации: НЕ ОПРЕДЕЛЁН ({vpn_name})")
+        header_lines.append(f"Тип конфигурации: Не определено ({vpn_name})")
 
     header_lines.append("")
 
