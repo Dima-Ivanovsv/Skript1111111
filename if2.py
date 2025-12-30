@@ -12,6 +12,9 @@ from flask import (
     make_response,
 )
 
+# =========================
+#  Общие утилиты статусов
+# =========================
 
 STATUS_LEVELS = ["good", "ok", "bad", "critical"]
 
@@ -69,7 +72,7 @@ def make_report(vpn_name, conf_type, check_list):
     summary = summary_info["summary"]
     overall_text = summary_info["overall"]
 
-    header_lines.append("ИТОГОВАЯ РЕЗОЛЮЦИЯ:")
+    header_lines.append("Итоговый отчет:")
     header_lines.append(overall_text)
     header_lines.append(
         f"Параметров в состоянии Хорошо: {summary['good']}, "
@@ -102,6 +105,9 @@ def make_report(vpn_name, conf_type, check_list):
     return "\n".join(header_lines + body_lines)
 
 
+# =========================
+#   OpenVPN: парсер
+# =========================
 
 def parse_openvpn_config(text):
     line_list = []
@@ -112,7 +118,7 @@ def parse_openvpn_config(text):
         if not line or line.startswith("#") or line.startswith(";"):
             continue
 
-      
+        # отрезаем комментарии в конце строки, если они не в кавычках
         for com in ("#", ";"):
             if com in line:
                 before, after = line.split(com, 1)
@@ -154,6 +160,7 @@ def ovpn_all_pushes(ovpn_dict):
 
 
 def detect_openvpn_type(ovpn_dict):
+    # Явные маркеры
     if ovpn_has(ovpn_dict, "server") or ovpn_has(ovpn_dict, "server-bridge"):
         return "server"
     if ovpn_has(ovpn_dict, "client"):
@@ -187,12 +194,14 @@ def detect_openvpn_type(ovpn_dict):
     return "unknown"
 
 
-
+# =========================
+#   OpenVPN: проверки
+# =========================
 
 def check_openvpn_network(ovpn_dict, conf_type):
     checks = []
 
-   
+    # proto
     proto_val = ovpn_first_arg(ovpn_dict, "proto")
     if proto_val is None:
         status = "bad"
@@ -210,7 +219,7 @@ def check_openvpn_network(ovpn_dict, conf_type):
             detail = f"proto {proto_val} — нестандартное значение, требуется ручная проверка."
     checks.append({"param": "proto", "status": status, "detail": detail})
 
-    
+    # dev
     dev_val = ovpn_first_arg(ovpn_dict, "dev")
     if dev_val is None:
         status = "ok"
@@ -228,7 +237,7 @@ def check_openvpn_network(ovpn_dict, conf_type):
             detail = f"dev {dev_val} — нестандартное значение, требуется ручная оценка."
     checks.append({"param": "dev", "status": status, "detail": detail})
 
-   
+    # port (только для сервера) или remote (для клиента)
     if conf_type == "server":
         port_val = ovpn_first_arg(ovpn_dict, "port")
         if port_val is None:
@@ -269,7 +278,7 @@ def check_openvpn_network(ovpn_dict, conf_type):
             detail = "remote задан — клиент знает адрес сервера. Конкретные значения требуют ручной проверки."
         checks.append({"param": "remote", "status": status, "detail": detail})
 
-   
+    # topology
     topo_val = ovpn_first_arg(ovpn_dict, "topology")
     if topo_val is None:
         status = "ok"
@@ -302,7 +311,7 @@ def check_openvpn_crypto(ovpn_dict):
     old_ok = {"AES-256-CBC", "AES-192-CBC", "AES-128-CBC"}
     weak = {"BF-CBC", "DES", "DES-EDE3-CBC", "RC4", "NONE"}
 
-  
+    # data-ciphers
     if ovpn_has(ovpn_dict, "data-ciphers"):
         raw = " ".join(ovpn_dict["data-ciphers"][0])
         cipher_list = [c.strip().upper() for c in re.split(r"[,:]", raw) if c.strip()]
@@ -338,7 +347,7 @@ def check_openvpn_crypto(ovpn_dict):
         )
     checks.append({"param": "data-ciphers", "status": status, "detail": detail})
 
-    
+    # устаревший cipher
     if ovpn_has(ovpn_dict, "cipher"):
         raw = " ".join(ovpn_dict["cipher"][0])
         status = "critical"
@@ -347,7 +356,7 @@ def check_openvpn_crypto(ovpn_dict):
         )
         checks.append({"param": "cipher", "status": status, "detail": detail})
 
-    
+    # auth
     auth_val = ovpn_first_arg(ovpn_dict, "auth")
     if auth_val is None:
         status = "ok"
@@ -368,7 +377,7 @@ def check_openvpn_crypto(ovpn_dict):
             detail = f"auth {a} — нестандартное значение, требуется дополнительная проверка."
     checks.append({"param": "auth", "status": status, "detail": detail})
 
-    
+    # replay-window
     if ovpn_has(ovpn_dict, "replay-window"):
         status = "good"
         detail = "Параметр replay-window задан — включена защита от повтора пакетов."
@@ -377,7 +386,7 @@ def check_openvpn_crypto(ovpn_dict):
         detail = "Параметр replay-window не задан — используется значение по умолчанию. Рекомендуется убедиться, что защита от повторов включена."
     checks.append({"param": "replay-window", "status": status, "detail": detail})
 
-    
+    # mute-replay-warnings
     if ovpn_has(ovpn_dict, "mute-replay-warnings"):
         status = "ok"
         detail = "mute-replay-warnings включён — предупреждения о повторах пакетов подавляются. Это уменьшает шум логов, но может скрыть атаки."
@@ -397,7 +406,7 @@ def check_openvpn_tls_pki(ovpn_dict, conf_type):
     has_key = ovpn_has(ovpn_dict, "key")
     has_secret = ovpn_has(ovpn_dict, "secret")
 
-    
+    # PKI vs static key
     if has_secret and (has_ca or has_cert or has_key):
         status = "bad"
         detail = "Используются одновременно static key (secret) и элементы PKI (ca/cert/key). Рекомендуется выбрать один подход."
@@ -412,7 +421,7 @@ def check_openvpn_tls_pki(ovpn_dict, conf_type):
         detail = "Отсутствуют корректные параметры PKI или static key (нет полного набора ca/cert/key и нет secret)."
     checks.append({"param": "PKI/static key", "status": status, "detail": detail})
 
-   
+    # tls-version-min
     tls_ver = ovpn_first_arg(ovpn_dict, "tls-version-min")
     if tls_ver is None:
         status = "bad"
@@ -442,7 +451,7 @@ def check_openvpn_tls_pki(ovpn_dict, conf_type):
             detail = f"tls-version-min {tv} — некорректное значение, требуется исправить."
     checks.append({"param": "tls-version-min", "status": status, "detail": detail})
 
-    
+    # tls-auth / tls-crypt
     has_ta = ovpn_has(ovpn_dict, "tls-auth")
     has_tc = ovpn_has(ovpn_dict, "tls-crypt") or ovpn_has(ovpn_dict, "tls-crypt-v2")
 
@@ -457,7 +466,7 @@ def check_openvpn_tls_pki(ovpn_dict, conf_type):
         detail = "Не используются tls-auth/tls-crypt. Управляющий канал уязвим к некоторым атакам (сканирование, DoS)."
     checks.append({"param": "tls-auth/tls-crypt", "status": status, "detail": detail})
 
-    
+    # dh/ecdh-curve
     dh_present = ovpn_has(ovpn_dict, "dh")
     ecdh_present = ovpn_has(ovpn_dict, "ecdh-curve")
     if dh_present or ecdh_present:
@@ -468,9 +477,9 @@ def check_openvpn_tls_pki(ovpn_dict, conf_type):
         detail = "Параметры DH/ECDH не заданы явно. Необходимо убедиться, что используется безопасная группа по умолчанию."
     checks.append({"param": "dh/ecdh-curve", "status": status, "detail": detail})
 
-    
+    # Проверка verify-client-cert / crl-verify / remote-cert-tls
     if conf_type == "server":
-        
+        # сервер
         verify_client = ovpn_has(ovpn_dict, "verify-client-cert")
         crl = ovpn_has(ovpn_dict, "crl-verify")
         rct_client = False
@@ -494,7 +503,7 @@ def check_openvpn_tls_pki(ovpn_dict, conf_type):
         checks.append({"param": "verify-client-cert/crl-verify/remote-cert-tls client", "status": status, "detail": detail})
 
     elif conf_type == "client":
-        
+        # клиент
         rct_server = False
         for v in ovpn_dict.get("remote-cert-tls", []):
             if v and v[0].lower() == "server":
@@ -544,7 +553,7 @@ def check_openvpn_access(ovpn_dict, conf_type):
 def check_openvpn_sessions(ovpn_dict, conf_type):
     checks = []
 
-
+    # keepalive / ping / ping-restart
     has_keepalive = ovpn_has(ovpn_dict, "keepalive")
     has_ping = ovpn_has(ovpn_dict, "ping")
     has_ping_restart = ovpn_has(ovpn_dict, "ping-restart")
@@ -582,7 +591,7 @@ def check_openvpn_sessions(ovpn_dict, conf_type):
             detail = "Не заданы keepalive/ping/ping-restart для клиента — допустимо, но можно улучшить устойчивость."
     checks.append({"param": "keepalive/ping/ping-restart", "status": status, "detail": detail})
 
-    
+    # persist-key/persist-tun
     has_persist_key = ovpn_has(ovpn_dict, "persist-key")
     has_persist_tun = ovpn_has(ovpn_dict, "persist-tun")
 
@@ -618,7 +627,7 @@ def check_openvpn_logging(ovpn_dict, conf_type):
             detail = "На клиенте не настроено отдельное логирование — это допустимо, но усложняет диагностику."
     checks.append({"param": "log/log-append/status", "status": status, "detail": detail})
 
-    
+    # verb
     verb_val = ovpn_first_arg(ovpn_dict, "verb")
     if verb_val is None:
         status = "ok"
@@ -649,7 +658,7 @@ def check_openvpn_logging(ovpn_dict, conf_type):
 def check_openvpn_server_extra(ovpn_dict):
     checks = []
 
-    
+    # ifconfig-pool-persist
     if ovpn_has(ovpn_dict, "ifconfig-pool-persist"):
         status = "good"
         detail = "ifconfig-pool-persist задан — IP-адреса клиентов фиксируются, что упрощает аудит."
@@ -658,7 +667,7 @@ def check_openvpn_server_extra(ovpn_dict):
         detail = "ifconfig-pool-persist не задан — IP клиентов могут меняться, аудит затруднён."
     checks.append({"param": "ifconfig-pool-persist", "status": status, "detail": detail})
 
-    
+    # push redirect-gateway и DNS
     pushes = ovpn_all_pushes(ovpn_dict)
     has_redirect = any("redirect-gateway" in p for p in pushes)
     has_dns = any("dhcp-option" in p and "DNS" in p.upper() for p in pushes)
@@ -674,7 +683,7 @@ def check_openvpn_server_extra(ovpn_dict):
         detail = "Полный туннель (redirect-gateway) не используется. Это допустимо для split-tunneling."
     checks.append({"param": 'push "redirect-gateway"/"dhcp-option DNS"', "status": status, "detail": detail})
 
-    
+    # client-to-client
     if ovpn_has(ovpn_dict, "client-to-client"):
         status = "bad"
         detail = (
@@ -685,7 +694,7 @@ def check_openvpn_server_extra(ovpn_dict):
         detail = "client-to-client не используется — клиенты изолированы друг от друга на уровне сервера."
     checks.append({"param": "client-to-client", "status": status, "detail": detail})
 
-    
+    # user/group
     has_user = ovpn_has(ovpn_dict, "user")
     has_group = ovpn_has(ovpn_dict, "group")
     if has_user and has_group:
@@ -696,7 +705,7 @@ def check_openvpn_server_extra(ovpn_dict):
         detail = "Параметры user/group не заданы — сервер может работать с правами root. Рекомендуется их ограничить."
     checks.append({"param": "user/group", "status": status, "detail": detail})
 
-    
+    # chroot
     if ovpn_has(ovpn_dict, "chroot"):
         status = "good"
         detail = "chroot задан — процесс OpenVPN изолирован в отдельном каталоге."
@@ -711,7 +720,7 @@ def check_openvpn_server_extra(ovpn_dict):
 def check_openvpn_client_extra(ovpn_dict):
     checks = []
 
-    
+    # auth-user-pass / auth-nocache
     has_auth_user_pass = ovpn_has(ovpn_dict, "auth-user-pass")
     has_auth_nocache = ovpn_has(ovpn_dict, "auth-nocache")
 
@@ -729,7 +738,7 @@ def check_openvpn_client_extra(ovpn_dict):
         detail = "auth-user-pass не используется — вероятно, применяется аутентификация только по сертификатам."
     checks.append({"param": "auth-nocache", "status": status, "detail": detail})
 
-    
+    # nobind
     if ovpn_has(ovpn_dict, "nobind"):
         status = "good"
         detail = "nobind включён — клиент не закрепляет локальный порт, что удобно за NAT/файрволами."
@@ -738,7 +747,7 @@ def check_openvpn_client_extra(ovpn_dict):
         detail = "nobind не используется — клиент может использовать фиксированный локальный порт."
     checks.append({"param": "nobind", "status": status, "detail": detail})
 
-    
+    # verify-x509-name
     if ovpn_has(ovpn_dict, "verify-x509-name"):
         status = "good"
         detail = "verify-x509-name задан — клиент дополнительно проверяет идентичность сертификата сервера."
@@ -780,7 +789,9 @@ def analyze_openvpn_config_text(text):
     return make_report("OpenVPN", conf_type, checks)
 
 
-
+# =========================
+#   WireGuard: парсер
+# =========================
 
 def parse_wireguard_config(text):
     section_list = []
@@ -854,11 +865,14 @@ def detect_wireguard_type(wg_iface, wg_peers):
     return "unknown"
 
 
+# =========================
+#   WireGuard: проверки
+# =========================
 
 def check_wireguard_interface(wg_iface, wg_peers, conf_type):
     checks = []
 
-    
+    # PrivateKey
     priv = wg_get_first(wg_iface, "privatekey")
     if priv:
         status = "good"
@@ -868,7 +882,7 @@ def check_wireguard_interface(wg_iface, wg_peers, conf_type):
         detail = "В секции [Interface] отсутствует PrivateKey — конфигурация некорректна."
     checks.append({"param": "[Interface] PrivateKey", "status": status, "detail": detail})
 
-    
+    # Address
     addr_vals = wg_iface.get("address", [])
     if addr_vals:
         status = "good"
@@ -878,7 +892,7 @@ def check_wireguard_interface(wg_iface, wg_peers, conf_type):
         detail = "В секции [Interface] отсутствует Address. Интерфейс может быть неадресован."
     checks.append({"param": "[Interface] Address", "status": status, "detail": detail})
 
-    
+    # ListenPort
     listen_port = wg_get_first(wg_iface, "listenport")
     if conf_type == "server":
         if listen_port:
@@ -897,7 +911,7 @@ def check_wireguard_interface(wg_iface, wg_peers, conf_type):
             detail = "[Interface] ListenPort не задан у клиента — типичный случай."
         checks.append({"param": "[Interface] ListenPort", "status": status, "detail": detail})
 
-    
+    # DNS
     dns_vals = wg_iface.get("dns", [])
     if conf_type == "client":
         if dns_vals:
@@ -908,7 +922,7 @@ def check_wireguard_interface(wg_iface, wg_peers, conf_type):
             detail = "[Interface] DNS не задан — возможны DNS-утечки при полном туннеле."
         checks.append({"param": "[Interface] DNS", "status": status, "detail": detail})
 
-    
+    # PublicKey в [Interface] — подозрительно
     if "publickey" in wg_iface:
         status = "bad"
         detail = "В секции [Interface] указан PublicKey — обычно сюда помещают только PrivateKey."
@@ -923,7 +937,7 @@ def check_wireguard_peers(wg_peers, conf_type):
     for idx, peer_dict in enumerate(wg_peers, start=1):
         prefix = f"[Peer #{idx}] "
 
-        
+        # PublicKey
         pub = wg_get_first(peer_dict, "publickey")
         if pub:
             status = "good"
@@ -933,13 +947,13 @@ def check_wireguard_peers(wg_peers, conf_type):
             detail = f"{prefix}PublicKey отсутствует — пир некорректно настроен."
         checks.append({"param": prefix + "PublicKey", "status": status, "detail": detail})
 
-        
+        # PrivateKey в [Peer] — критично
         if "privatekey" in peer_dict:
             status = "critical"
             detail = f"{prefix}PrivateKey указан в секции [Peer] — приватный ключ не должен храниться у удалённого пира."
             checks.append({"param": prefix + "PrivateKey", "status": status, "detail": detail})
 
-        
+        # PresharedKey
         psk = wg_get_first(peer_dict, "presharedkey")
         if psk:
             status = "good"
@@ -949,7 +963,7 @@ def check_wireguard_peers(wg_peers, conf_type):
             detail = f"{prefix}PresharedKey не задан — это допустимо, но PSK повышает безопасность."
         checks.append({"param": prefix + "PresharedKey", "status": status, "detail": detail})
 
-        
+        # AllowedIPs
         allowed = peer_dict.get("allowedips", [])
         if not allowed:
             status = "critical"
@@ -982,7 +996,7 @@ def check_wireguard_peers(wg_peers, conf_type):
                 detail = f"{prefix}AllowedIPs заданы, но роль конфигурации не определена."
         checks.append({"param": prefix + "AllowedIPs", "status": status, "detail": detail})
 
-        
+        # Endpoint
         endpoint = wg_get_first(peer_dict, "endpoint")
         if conf_type == "client":
             if endpoint:
@@ -1007,7 +1021,7 @@ def check_wireguard_peers(wg_peers, conf_type):
                 detail = f"{prefix}Endpoint не задан, роль конфигурации не определена."
         checks.append({"param": prefix + "Endpoint", "status": status, "detail": detail})
 
-        
+        # PersistentKeepalive
         keep = wg_get_first(peer_dict, "persistentkeepalive")
         if keep:
             status = "good"
@@ -1023,7 +1037,7 @@ def check_wireguard_peers(wg_peers, conf_type):
 def check_wireguard_relations(wg_iface, wg_peers):
     checks = []
 
-    
+    # Адреса интерфейса
     iface_ip_list = []
     for val in wg_iface.get("address", []):
         for token in re.split(r"[,\s]+", val):
@@ -1036,7 +1050,7 @@ def check_wireguard_relations(wg_iface, wg_peers):
             except ValueError:
                 continue
 
-    
+    # Сети AllowedIPs по пирам
     wg_peers_nets = []
     for peer_dict in wg_peers:
         net_list = []
@@ -1052,7 +1066,7 @@ def check_wireguard_relations(wg_iface, wg_peers):
                     continue
         wg_peers_nets.append(net_list)
 
-    
+    # Пересечения AllowedIPs между peers
     for i in range(len(wg_peers_nets)):
         for j in range(i + 1, len(wg_peers_nets)):
             nets1 = wg_peers_nets[i]
@@ -1071,7 +1085,7 @@ def check_wireguard_relations(wg_iface, wg_peers):
                             ),
                         })
 
-    
+    # Пересечение Address и AllowedIPs (маршрут на себя)
     for idx, net_list in enumerate(wg_peers_nets, start=1):
         for ip_obj in iface_ip_list:
             for net_obj in net_list:
